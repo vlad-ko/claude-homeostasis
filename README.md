@@ -41,6 +41,18 @@ That was the attic. Ten days later we searched the rest of the house:
 
 Nothing broke. Everything drifted. That is the trouble with drift: no single step is ever alarming, so nobody sounds the alarm, right up until someone trips over the result.
 
+## Why not just ask Claude?
+
+The obvious fix was already sitting in the terminal: ask Claude to tidy up. That turned out to be how the mess got made.
+
+An agent asked to tidy up tidies to its own idea of tidy, and that idea changes from one session to the next. One day it keeps tens of gigabytes of test databases, because someone might need them. The next it removes a worktree because it looks clean, while another agent is still working inside it. Neither choice is lazy. Both are judgment calls, and judgment is a poor place to keep a definition.
+
+So we wrote the definition down, and that is what `homeostasis` is: one resting state, the same rules on every run, and the evidence printed beside every decision. Claude no longer decides what clean means. Our cleanup today is a single sentence:
+
+> Bring my local back to homeostasis.
+
+Claude runs the check, shows the report, applies the safe part, and hands back the decisions that were always ours. Its intelligence goes into reading the report, not into rewriting the rules.
+
 ## What homeostasis means here
 
 Homeostasis is the biologist's word for how a living thing stays itself in a changing world. It was never about standing still; your temperature wanders all day long. It's about always finding the way back.
@@ -166,9 +178,11 @@ Run it from anywhere inside a repository, including from inside one of its workt
 
 **The first visit.** Run it and read the report. Each section either says `(ok)` or lists exactly what drifted. REMOVABLE items are what `--apply` would clean; KEEP-DIRTY and INCONCLUSIVE are yours to decide, and the report explains each one. When the list looks right, run `--apply`.
 
-**Make it a habit.** The best checkup is the one nobody has to remember. Add a line like this to your `CLAUDE.md`, and your agents will check the repo's temperature before they call a task done:
+**Make it a habit.** The best checkup is the one nobody has to remember. Add lines like these to your `CLAUDE.md`, and your agents will check the repo's temperature before they call a task done, and use the tool instead of their own judgment when you ask for a cleanup:
 
-> Before you finish a task, run `homeostasis --check` and include the result. Never run `--apply` without showing me the report first.
+> Before you finish a task, run `homeostasis --check` and include the result.
+>
+> When I ask you to bring my local back to homeostasis, run `homeostasis --check`, show me the report, then run `homeostasis --apply`. Never delete worktrees, branches, files or databases yourself; anything the tool marks KEEP-DIRTY or INCONCLUSIVE is my call.
 
 ## Configuration
 
