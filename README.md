@@ -139,7 +139,7 @@ Skip this if `echo $PATH` already shows it.
 ### 3. Optional extras
 
 - **See open pull requests:** install the [GitHub CLI](https://cli.github.com) and run `gh auth login`. Without it, `homeostasis` can't tell which branches have an open PR, so it plays safe and removes fewer worktrees.
-- **Claude Code users:** add `.claude/worktrees/` to your `.gitignore`. Otherwise the agents' worktrees appear as untracked files in your main checkout, and the tool will (correctly) point them out.
+- **Claude Code users:** nothing to do. Agent worktrees under `.claude/worktrees/` are checked as worktrees, and they won't show up as stray files in your main checkout, whether or not that folder is gitignored. Anything else left lying around in there still gets reported.
 
 **Where it runs:** macOS and Linux, both tested in CI. On Windows, use WSL, where it behaves like Linux. Native Windows shells aren't tested.
 
@@ -185,7 +185,7 @@ Commit `.homeostasis` so your whole team shares it. If you don't, list it in `.g
 test/run.sh
 ```
 
-There are 187 checks. They build throwaway repositories and stand in for `gh` and `docker`, so nothing real is touched. CI runs them on Linux and macOS.
+There are 198 checks. They build throwaway repositories and stand in for `gh` and `docker`, so nothing real is touched. CI runs them on Linux and macOS.
 
 ## License
 

@@ -171,7 +171,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 PROJECT="claude-homeostasis"
 DOC="https://github.com/vlad-ko/claude-homeostasis/blob/main/docs/how-it-works.md"
 CONFIG_FILE_NAME=".homeostasis"
@@ -1162,15 +1162,60 @@ check_primary_fresh() {
 # someone's unfinished work and an untracked path is usually a file that
 # belongs in a scratch directory, so both are surfaced by name for a human. A
 # failed `git status` is INCONCLUSIVE, never "clean".
+#
+# Worktrees that live INSIDE the primary (Claude Code puts them under
+# .claude/worktrees/) are excluded from the untracked list: unless that
+# directory is gitignored, git reports every live worktree as an untracked path
+# of the primary, and each one is already accounted for by section 4
+# (registered) or section 6 (debris). Excluding them is deliberately narrow:
+#   - only the worktrees dir and the exact paths git REGISTERS as worktrees are
+#     excluded, so a stray file beside them is still reported (git names it by
+#     its untracked parent directory, e.g. `.claude/`);
+#   - a loose FILE directly inside the worktrees dir is in neither section 4
+#     nor section 6, so it is named here unless git ignores it;
+#   - a failed worktree listing excludes only the worktrees dir: reporting a
+#     worktree as untracked is noise, hiding a real file would be silence.
+# Modified tracked files are read WITHOUT any exclusion.
 check_primary_tree() {
-    local status='' modified='' untracked='' n=0
+    local status='' modified='' untracked='' n=0 listing='' wt_path='' rest='' loose='' rel='' rc=0
     section "2/3. primary working tree"
-    if ! status="$(git -C "$PRIMARY" status --porcelain --untracked-files=normal 2>/dev/null)"; then
+    set -- .
+    if [ -n "$WORKTREES_REL" ]; then
+        set -- "$@" ":(exclude,literal)$WORKTREES_REL"
+    fi
+    if listing="$(list_worktrees)"; then
+        while IFS="$TAB" read -r wt_path rest; do
+            case "$wt_path" in
+                "$PRIMARY"/*) set -- "$@" ":(exclude,literal)${wt_path#"$PRIMARY"/}" ;;
+            esac
+        done <<EOF
+$listing
+EOF
+    fi
+    if ! status="$(git -C "$PRIMARY" status --porcelain --untracked-files=no 2>/dev/null)"; then
         violation "git status FAILED in the primary — working-tree state INCONCLUSIVE"
         return 0
     fi
-    modified="$(printf '%s\n' "$status" | grep -v '^??' | grep . || true)"
+    modified="$(printf '%s\n' "$status" | grep . || true)"
+    if ! status="$(git -C "$PRIMARY" status --porcelain --untracked-files=normal -- "$@" 2>/dev/null)"; then
+        violation "git status FAILED in the primary — working-tree state INCONCLUSIVE"
+        return 0
+    fi
     untracked="$(printf '%s\n' "$status" | grep '^??' || true)"
+    if [ -n "$WORKTREES_REL" ] && [ -d "$WORKTREES_DIR" ]; then
+        while IFS= read -r loose; do
+            [ -n "$loose" ] || continue
+            rel="$WORKTREES_REL/${loose##*/}"
+            rc=0
+            git -C "$PRIMARY" check-ignore -q -- "$rel" 2>/dev/null || rc=$?
+            # 0 = ignored (deliberate, not drift); 1 = not ignored; anything
+            # else = the read failed, so it is reported rather than hidden.
+            [ "$rc" -eq 0 ] && continue
+            untracked="${untracked:+${untracked}${NL}}?? $rel"
+        done <<EOF
+$(find "$WORKTREES_DIR" -mindepth 1 -maxdepth 1 ! -type d | sort)
+EOF
+    fi
 
     if [ -z "$modified" ]; then
         printf '   modified tracked files: none (ok)\n'

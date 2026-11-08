@@ -4,6 +4,19 @@ All notable changes to claude-homeostasis are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-11-08
+
+### Fixed
+
+- Worktrees that live inside the repository (Claude Code's `.claude/worktrees/`,
+  or any registered worktree nested in the primary) are no longer reported as
+  untracked files of the primary checkout when that directory is not
+  gitignored. They are already covered by the worktree and debris sections.
+  Any other untracked file next to them is still reported, and a loose file
+  directly inside the worktrees directory is named unless git ignores it.
+- The test harness no longer picks up the host's global git config or global
+  excludes file.
+
 ## [0.1.0] - 2026-11-07
 
 ### Added
@@ -30,4 +43,5 @@ project uses [Semantic Versioning](https://semver.org/).
   and `docker`, no network) and a CI workflow running it with shellcheck on
   Linux and macOS.
 
+[0.1.1]: https://github.com/vlad-ko/claude-homeostasis/releases/tag/v0.1.1
 [0.1.0]: https://github.com/vlad-ko/claude-homeostasis/releases/tag/v0.1.0

@@ -31,7 +31,7 @@ The authoritative wording of every rule below is the header comment of the `home
 |---|-------|----------------|----------------|
 | 1 | Primary branch and freshness | primary not on main, detached, behind or ahead of `<remote>/<main>` after `git fetch`; a failed fetch is INCONCLUSIVE | nothing (never checks out, resets or merges) |
 | 2 | Modified tracked files in the primary | any | nothing |
-| 3 | Untracked paths in the primary | any | nothing |
+| 3 | Untracked paths in the primary | any, except worktrees that live inside the primary (the worktrees dir and every registered worktree path), which sections 4 and 6 already account for; a loose file directly in the worktrees dir is still reported unless git ignores it | nothing |
 | 4 | Non-primary worktrees | REMOVABLE, KEEP-DIRTY, INCONCLUSIVE or PRUNABLE | unforced `git worktree remove` on REMOVABLE, `git worktree prune` |
 | 5 | Local branches merged into main | any (attached to a worktree or not) | `git branch -d` on unattached ones |
 | 5b | `pr<N>` scratch branches (needs `gh`) | GitHub merged exactly this tip, or the read failed, or the tip diverged | `git branch -D` only on "merged at exactly this tip" |

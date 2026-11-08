@@ -55,6 +55,13 @@ TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/homeostasis-test.XXXXXX")"
 # the symlinked spelling; git reports real paths. Canonicalize once so every
 # path this test compares against script output is in git's spelling.
 TMPROOT="$(cd "$TMPROOT" && pwd -P)"
+# Hermetic git: the host's global config and global excludes file must not
+# leak in. A developer's ~/.config/git/ignore (which commonly ignores
+# .claude/settings.local.json) silently changed what case 27 saw.
+XDG_DIR="$TMPROOT/xdg"
+mkdir -p "$XDG_DIR"
+export XDG_CONFIG_HOME="$XDG_DIR"
+export GIT_CONFIG_GLOBAL=/dev/null
 # shellcheck disable=SC2329  # invoked indirectly by the EXIT trap below
 cleanup() {
     case "$TMPROOT" in
@@ -985,7 +992,7 @@ must mkdir -p "$L26/bin" "$L26/not-a-repo"
 out="$(run_hs "$L26" "$L26/not-a-repo" "$SUBJECT" --version)"
 rc=$?
 assert_exit "$rc" 0 "--version exits 0"
-assert_contains "$out" "claude-homeostasis 0.1.0" "--version names the project and version"
+assert_contains "$out" "claude-homeostasis 0.1.1" "--version names the project and version"
 out="$(run_hs "$L26" "$L26/not-a-repo" "$SUBJECT" --help)"
 rc=$?
 assert_exit "$rc" 0 "--help exits 0"
@@ -997,6 +1004,70 @@ out="$(GIT_CEILING_DIRECTORIES="$L26" run_hs "$L26" "$L26/not-a-repo" "$SUBJECT"
 rc=$?
 assert_exit "$rc" 2 "outside a git working tree exits 2"
 assert_contains "$out" "not inside a git working tree" "with a clear message"
+
+# --- 27. worktrees nested in the primary are not "untracked files" ------------
+#
+# Claude Code puts agent worktrees under .claude/worktrees/ INSIDE the repo. If
+# that directory is not gitignored, git reports each worktree as an untracked
+# path of the primary, so every live agent made section 2/3 cry wolf. Every
+# worktree is already accounted for by section 4 (registered) or section 6
+# (debris), so section 2/3 must not report them a second time; anything ELSE
+# untracked (a stray file beside them, a loose file inside the worktrees dir)
+# must still be reported.
+
+echo "27. worktrees nested inside the primary are not reported as untracked paths"
+L27="$TMPROOT/nested"
+must mkdir -p "$L27"
+make_layout "$L27"
+clear_layout "$L27"
+printf 'vendor/\nnode_modules/\n' > "$L27/primary/.gitignore" || fixture_die "cannot rewrite .gitignore"
+must git -C "$L27/primary" commit -q -am 'stop ignoring worktree dirs'
+must git_quiet -C "$L27/primary" push -q origin main
+must git -C "$L27/primary" worktree add -q "$L27/primary/.claude/worktrees/agent-1" -b feat/agent-1
+must git -C "$L27/primary" worktree add -q "$L27/primary/elsewhere/wt-2" -b feat/wt-2
+must mkdir -p "$L27/primary/.claude/worktrees/ghost/vendor"
+printf 'x\n' > "$L27/primary/.claude/worktrees/ghost/vendor/lib.txt" || fixture_die "cannot write ghost"
+
+# report_section cannot take "2/3" (the slash ends its sed address), so this
+# section is cut out directly — and an empty cut fails loudly, because every
+# assert_not_contains below would pass vacuously on an empty string.
+primary_tree_section() {
+    local s=''
+    s="$(printf '%s\n' "$1" | sed -n '/^== 2\/3\./,/^== 4\./p')"
+    [ -n "$s" ] || fail "section 2/3 could not be extracted from the report"
+    printf '%s\n' "$s"
+}
+
+out="$(run_hs "$L27" "$L27/primary" "$L27/primary/scripts/homeostasis" --check)"
+sec="$(primary_tree_section "$out")"
+assert_contains "$sec" "untracked paths: none (ok)" "nested worktrees and debris are not untracked paths of the primary"
+assert_contains "$(report_section "$out" 4)" "$L27/primary/.claude/worktrees/agent-1" "the nested worktree is still reported in section 4"
+assert_contains "$(report_section "$out" 4)" "$L27/primary/elsewhere/wt-2" "a worktree nested outside the worktrees dir is still reported in section 4"
+assert_contains "$(report_section "$out" 6)" "ghost" "the debris directory is still reported in section 6"
+
+printf 'note\n' > "$L27/primary/.claude/settings.local.json" || fixture_die "cannot write stray"
+printf 'loose\n' > "$L27/primary/.claude/worktrees/stray.txt" || fixture_die "cannot write loose file"
+printf 'loose\n' > "$L27/primary/elsewhere/stray2.txt" || fixture_die "cannot write loose file"
+out="$(run_hs "$L27" "$L27/primary" "$L27/primary/scripts/homeostasis" --check)"
+sec="$(primary_tree_section "$out")"
+# git reports an untracked directory collapsed (`.claude/`, `elsewhere/`), not
+# file by file, so those two are asserted as whole lines; the loose file inside
+# the worktrees dir is named by the script itself, so its full path is asserted.
+assert_line() {
+    if printf '%s\n' "$1" | sed 's/^ *//' | grep -Fx -- "$2" >/dev/null; then pass "$3"; else fail "$3 (expected a line: $2)"; fi
+}
+assert_line "$sec" ".claude/" "a stray file beside the worktrees dir is still reported (as .claude/)"
+assert_line "$sec" ".claude/worktrees/stray.txt" "a loose file inside the worktrees dir is still reported by name"
+assert_line "$sec" "elsewhere/" "a loose file beside a nested worktree is still reported (as elsewhere/)"
+assert_contains "$sec" "VIOLATION: 3 untracked path(s)" "exactly those three, and nothing for the worktrees themselves"
+
+# A loose file the repo deliberately ignores is not drift.
+printf '.claude/worktrees/stray.txt\n' >> "$L27/primary/.git/info/exclude" || fixture_die "cannot write info/exclude"
+out="$(run_hs "$L27" "$L27/primary" "$L27/primary/scripts/homeostasis" --check)"
+sec="$(primary_tree_section "$out")"
+assert_not_contains "$sec" "stray.txt" "an ignored loose file inside the worktrees dir is not reported"
+assert_not_contains "$sec" "agent-1" "the worktree itself is still not reported as untracked"
+assert_not_contains "$sec" "ghost" "the debris directory is still not reported as untracked"
 
 # --- summary ------------------------------------------------------------------
 
