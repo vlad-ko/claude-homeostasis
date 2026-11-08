@@ -45,7 +45,7 @@ Nothing broke. Everything drifted. That is the trouble with drift: no single ste
 
 The obvious fix was already sitting in the terminal: ask Claude to tidy up. That turned out to be how the mess got made.
 
-An agent asked to tidy up tidies to its own idea of tidy, and that idea changes from one session to the next. One day it keeps 50 GB of test databases, because someone might need them. The next it removes a worktree because it looks clean, while another agent is still working inside it. Neither choice is lazy. Both are judgment calls, and judgment is a poor place to keep a definition.
+An agent asked to tidy up tidies to its own idea of tidy, and that idea changes from one session to the next. One day it keeps tens of gigabytes of test databases, because someone might need them. The next it removes a worktree because it looks clean, while another agent is still working inside it. Neither choice is lazy. Both are judgment calls, and judgment is a poor place to keep a definition.
 
 So we wrote the definition down, and that is what `homeostasis` is: one resting state, the same rules on every run, and the evidence printed beside every decision. Claude no longer decides what clean means. Our cleanup today is a single sentence:
 
