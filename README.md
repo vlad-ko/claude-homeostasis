@@ -41,6 +41,18 @@ That was the attic. Ten days later we searched the rest of the house:
 
 Nothing broke. Everything drifted. That is the trouble with drift: no single step is ever alarming, so nobody sounds the alarm, right up until someone trips over the result.
 
+## Why not just ask Claude?
+
+The obvious fix was already sitting in the terminal: ask Claude to tidy up. That turned out to be how the mess got made.
+
+An agent asked to tidy up tidies to its own idea of tidy, and that idea changes from one session to the next. One day it keeps 50 GB of test databases, because someone might need them. The next it removes a worktree because it looks clean, while another agent is still working inside it. Neither choice is lazy. Both are judgment calls, and judgment is a poor place to keep a definition.
+
+So we wrote the definition down, and that is what `homeostasis` is: one resting state, the same rules on every run, and the evidence printed beside every decision. Claude no longer decides what clean means. Our cleanup today is a single sentence:
+
+> Bring my local back to homeostasis.
+
+Claude runs the check, shows the report, applies the safe part, and hands back the decisions that were always ours. Its intelligence goes into reading the report, not into rewriting the rules.
+
 ## What homeostasis means here
 
 Homeostasis is the biologist's word for how a living thing stays itself in a changing world. It was never about standing still; your temperature wanders all day long. It's about always finding the way back.
@@ -62,18 +74,6 @@ Because `prune` only forgets folders that are already gone, `git branch -d` only
 > *Is anyone still working here, and is the work safe somewhere else?*
 
 `homeostasis` asks that question of every worktree, checks the answer against git and (if you have it) GitHub, and acts only when the evidence is in. It's less a broom than a doctor: it examines first, explains what it found, and treats only what it's sure about.
-
-## Why not just ask Claude to clean up?
-
-You can. That's how the mess got made.
-
-Ask an agent to tidy up and it tidies to its own idea of tidy, which changes from one session to the next. One day it keeps 50 GB of test databases, because someone might need them. The next day it removes a worktree because it looks clean, while another agent is still working inside it. Neither choice is lazy. Both are judgment calls, and judgment is a poor place to keep a definition.
-
-`homeostasis` writes the definition down: one resting state, the same rules on every run, and the evidence printed beside every decision. The agent no longer decides what clean means. It only has to ask. Our everyday flow is one sentence to Claude:
-
-> Bring my local back to homeostasis.
-
-Claude runs the check, shows the report, applies the safe part, and hands back the decisions that were always yours. Its intelligence goes into reading the report, not into rewriting the rules.
 
 ## A checkup
 
