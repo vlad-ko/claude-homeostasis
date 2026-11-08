@@ -1,0 +1,1666 @@
+#!/usr/bin/env bash
+# homeostasis — every task ends on a CLEAN SLATE, and the primary checkout IS
+# the slate.
+#
+# Part of claude-homeostasis: https://github.com/vlad-ko/claude-homeostasis
+# MIT licensed. See LICENSE.
+#
+# Why this exists
+# ---------------
+# When many agents (or many humans) work in parallel git worktrees, the
+# repository accumulates drift: a primary checkout parked on a merged feature
+# branch, stray screenshots and scratch files at the repo root, hundreds of
+# worktrees for work that already landed, local branches merged long ago,
+# directories under the worktree parent that git no longer registers, and
+# per-worktree test databases whose worktree is gone. None of it is harmless.
+# A reader working from a stale primary reports merged work as ABSENT; a merge
+# conflict gets resolved against the wrong base; a leftover test database falls
+# out of step with the schema and produces false test failures.
+#
+# This script reports that drift and, on request, removes the subset of it
+# that can be removed WITHOUT ANY POSSIBILITY OF LOSING WORK. Its safety
+# posture is the product; read docs/how-it-works.md before changing what it
+# considers clean.
+#
+# Usage
+# -----
+#   homeostasis            same as --check
+#   homeostasis --check    print the report; exit 1 on ANY violation
+#   homeostasis --apply    perform ONLY the safe actions, then re-check
+#   homeostasis --help | --version
+#
+# Exit codes: 0 clean slate, 1 violations found, 2 usage error or fatal error.
+#
+# The report audits the PRIMARY worktree (first entry of `git worktree list
+# --porcelain`), never $PWD — so it is correct when invoked from inside an
+# agent worktree against that worktree's repository.
+#
+# It may be run from ANY checkout — the primary or any worktree. Two things
+# make that safe, and both are structural rather than a check at one call
+# site: (a) the worktree the command is run FROM (the one containing $PWD, and
+# the one containing this script if it lives inside the repository) is
+# resolved ONCE at startup and classified IN-USE, so it can never be
+# REMOVABLE; (b) after startup every git call is `-C "$PRIMARY"` or on an
+# absolute worktree path, so nothing depends on the caller's directory
+# surviving. Without (a), a run from a clean, unlocked worktree removes that
+# worktree mid-run, and every later git call fails with "cannot change to ...".
+#
+# The checks
+# ----------
+#   1.  the primary is on the main branch, and HEAD == <remote>/<main> after
+#       `git fetch <remote> <main>`
+#   2.  no modified tracked files in the primary
+#   3.  no untracked paths in the primary
+#   4.  every non-primary worktree classified (see below); REMOVABLE,
+#       KEEP-DIRTY, INCONCLUSIVE and PRUNABLE ones are violations
+#   5.  no local branch already merged into main — attached to a worktree or
+#       not (an attached one is a human's call: a branch contained in main
+#       carries no commit of its own, so --apply never removes its worktree)
+#   5b. no `pr<N>` scratch branch whose PR GitHub merged at exactly this tip
+#       (the squash-merge blind spot of check 5; needs `gh`)
+#   6.  no DEBRIS directory under the worktree parent — a physical directory
+#       git no longer registers (a removal that aborted mid-way)
+#   7.  no ORPHAN test schema — a MySQL database `<prefix>_<worktree>` whose
+#       worktree no longer exists (opt-in; see HOMEOSTASIS_MYSQL_CONTAINER)
+#
+# Every read a verdict depends on is checked for SUCCESS before its output is
+# believed: a failed `git worktree list`, `git branch --merged`, `git status`
+# or `docker exec ... mysql` is reported as INCONCLUSIVE — a violation — never
+# as "none (ok)", and --apply then performs nothing that depends on that read.
+# Absence of an answer is never rendered as a value.
+#
+# Classification of a non-primary worktree (the authoritative statement)
+# ----------------------------------------------------------------------
+#   PRUNABLE      its directory is gone; `git worktree prune` drops the record
+#   IN-USE        the worktree this command is RUNNING FROM, OR `locked` in
+#                 `git worktree list --porcelain`, OR its branch has an OPEN PR
+#                 (`gh pr list --state open`)
+#   INCONCLUSIVE  the reads cannot PROVE the work here is finished. Either one
+#                 of them FAILED (`gh` non-zero, `git status` non-zero,
+#                 `git rev-list --count` non-zero — the exit status and a
+#                 bounded stderr excerpt are printed, so a missing main, a
+#                 corrupt gitdir and a command error are told apart), or they
+#                 succeeded and no honest count can be derived from them:
+#                   - the branch carries NO commit of its own, which a worktree
+#                     created seconds ago and one whose work has landed answer
+#                     identically;
+#                   - HEAD is DETACHED, so no branch ref would survive the
+#                     removal and the count is beside the point;
+#                   - local main is BEHIND the freshly fetched <remote>/<main>,
+#                     so commits a worktree merely INHERITED from the newer tip
+#                     would count as its own.
+#                 Never removable. An empty `gh` read is "no PR" ONLY when `gh`
+#                 exited 0 (or HOMEOSTASIS_TRUST_NO_PRS=1 says so explicitly).
+#   REMOVABLE     `git status --porcelain --ignored` reports NO tracked change,
+#                 NO untracked path, every IGNORED path is REGENERABLE (the
+#                 allowlist below), AND the worktree is on a BRANCH carrying at
+#                 least one commit that a PROVEN-CURRENT local main does not —
+#                 the POSITIVE evidence that work was produced here and is now
+#                 held by a ref that outlives the directory. Only uncommitted
+#                 work can be lost by `git worktree remove`; the branch ref
+#                 survives.
+#   KEEP-DIRTY    anything else — a modification, an untracked path, a gutted
+#                 shell (every entry is ` D`), or an ignored path outside the
+#                 allowlist. Surfaced by name with the reason; never removed
+#                 by tooling, never force-removed.
+#
+# The regenerable allowlist (HOMEOSTASIS_REGENERABLE) is the set of ignored
+# paths a fresh checkout recreates from scratch: dependency directories, build
+# output, tool caches. `git status --porcelain` WITHOUT --ignored never lists
+# ignored files, so without --ignored plus this allowlist, a worktree holding
+# only a gitignored `.env` looks clean and `git worktree remove` deletes it.
+# Any other ignored path — `notes.txt`, a `.env.bak`, a local dump — makes the
+# worktree KEEP-DIRTY and is surfaced with its path. `.env` is deliberately NOT
+# in the default list: secrets are not regenerable in general.
+#
+# A DEBRIS directory is REMOVABLE only when it holds no `.git` entry and
+# nothing outside that same allowlist plus top-level `*.json` scratch;
+# otherwise it is SURFACED with the first offending path.
+#
+# What --apply does, and the full list of what it never does
+# ----------------------------------------------------------
+#   does:    unforced `git worktree remove` on REMOVABLE worktrees (each one
+#            re-classified immediately before removal — the report is not
+#            trusted across the gap), `git worktree prune`, `rm -rf` on
+#            REMOVABLE debris directories, `git branch -d` (lowercase, never
+#            -D) on merged branches not attached to any remaining worktree,
+#            `git branch -D` on pr<N> scratch branches gh confirms merged at
+#            exactly their tip, `DROP DATABASE` on orphan test schemas (never
+#            the base schema).
+#   never:   passes --force to `git worktree remove` — git's own refusal of a
+#            dirty tree is the LAST check before the delete, and a forced path
+#            re-opens exactly the window that refusal closes (an unlocked
+#            check-then-act); touches a modified or untracked file; removes a
+#            KEEP-DIRTY, IN-USE or INCONCLUSIVE worktree; checks out, resets or
+#            fetches anything beyond `fetch <remote> <main>`; deletes an
+#            unmerged branch; acts on a read that failed.
+#
+# Residual gap, stated honestly: `git worktree remove` checks the tree and
+# then deletes it inside ONE git process; that window is git's, not this
+# script's, and is the narrowest available. The ignored-path allowlist is
+# checked by THIS script only (git does not consider ignored files dirty), so
+# an ignored non-regenerable file created between the classification and the
+# remove is lost. A locked worktree (`git worktree lock`) is IN-USE and closes
+# even that window for the agent that holds it. "The branch ref survives" is a
+# claim about a worktree ON A BRANCH, so a DETACHED worktree is never
+# REMOVABLE at all — its commits would be left in the reflog only.
+#
+# Configuration
+# -------------
+# Environment variables, or KEY=value lines in `.homeostasis` at the primary
+# checkout's root. The file is PARSED, never sourced: only the keys below are
+# accepted, values are taken literally (no expansion, no command substitution),
+# and an environment variable always wins over the file.
+#
+#   HOMEOSTASIS_MAIN_BRANCH      default: <remote>/HEAD, else `main`
+#   HOMEOSTASIS_REMOTE           default: origin
+#   HOMEOSTASIS_WORKTREES_DIR    debris-scan dir relative to the primary;
+#                                default .claude/worktrees; empty disables
+#   HOMEOSTASIS_REGENERABLE      space-separated ignored paths that are safe
+#                                to lose (default: see DEFAULT_REGENERABLE)
+#   HOMEOSTASIS_MYSQL_CONTAINER  enables check 7; unset = skipped
+#   HOMEOSTASIS_SCHEMA_PREFIX    default: testing
+#   HOMEOSTASIS_GH               auto (default) | off
+#   HOMEOSTASIS_TRUST_NO_PRS     1 = with gh off, treat "no PR information" as
+#                                "no open PRs" (for non-GitHub repositories)
+#
+# Portability: bash 3.2 (macOS /bin/bash) and Linux; no GNU-only flags, no
+# `sed -i`, no `mapfile`, no associative arrays. Shells out to `git` (>= 2.23,
+# for `%(worktreepath)` in `git branch --format`, probed at startup), and
+# optionally `gh` and `docker`.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+PROJECT="claude-homeostasis"
+DOC="https://github.com/vlad-ko/claude-homeostasis/blob/main/docs/how-it-works.md"
+CONFIG_FILE_NAME=".homeostasis"
+# `gh pr list` needs an explicit ceiling; if the open-PR count reaches it the
+# read is INCOMPLETE and every open-PR verdict derived from it is inconclusive.
+GH_PR_LIMIT=500
+# `%(worktreepath)` (git branch --format) exists since git 2.23; an older git
+# fails the format with "unknown field name", so the probe is a version gate.
+MIN_GIT_MAJOR=2
+MIN_GIT_MINOR=23
+# MySQL's identifier limit; a derived schema name longer than this cannot be
+# the name a setup script created verbatim, so the mapping is refused.
+MYSQL_IDENT_MAX=64
+DEFAULT_WORKTREES_DIR=".claude/worktrees"
+# Conservative: only paths that a package manager, build or test tool
+# recreates from scratch. Add `.env` (or anything else) yourself, knowingly.
+DEFAULT_REGENERABLE="node_modules vendor .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox target dist build .next .nuxt .turbo .parcel-cache coverage .gradle .phpunit.cache .phpunit.result.cache .phpstan-cache"
+CONFIG_KEYS="HOMEOSTASIS_MAIN_BRANCH HOMEOSTASIS_REMOTE HOMEOSTASIS_WORKTREES_DIR HOMEOSTASIS_REGENERABLE HOMEOSTASIS_MYSQL_CONTAINER HOMEOSTASIS_SCHEMA_PREFIX HOMEOSTASIS_GH HOMEOSTASIS_TRUST_NO_PRS"
+
+TAB="$(printf '\t')"
+NL="$(printf '\n.')"; NL="${NL%.}"
+
+C_RED='' C_GREEN='' C_YELLOW='' C_BOLD='' C_RESET=''
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED="$(printf '\033[31m')"
+    C_GREEN="$(printf '\033[32m')"
+    C_YELLOW="$(printf '\033[33m')"
+    C_BOLD="$(printf '\033[1m')"
+    C_RESET="$(printf '\033[0m')"
+fi
+
+# Which configuration keys the ENVIRONMENT set (set-but-empty counts: an empty
+# HOMEOSTASIS_WORKTREES_DIR is a deliberate "disable"). Snapshotted before the
+# config file is read, so the file can never override the environment.
+ENV_SET=''
+[ -z "${HOMEOSTASIS_MAIN_BRANCH+x}" ] || ENV_SET="${ENV_SET}HOMEOSTASIS_MAIN_BRANCH${NL}"
+[ -z "${HOMEOSTASIS_REMOTE+x}" ] || ENV_SET="${ENV_SET}HOMEOSTASIS_REMOTE${NL}"
+[ -z "${HOMEOSTASIS_WORKTREES_DIR+x}" ] || ENV_SET="${ENV_SET}HOMEOSTASIS_WORKTREES_DIR${NL}"
+[ -z "${HOMEOSTASIS_REGENERABLE+x}" ] || ENV_SET="${ENV_SET}HOMEOSTASIS_REGENERABLE${NL}"
+[ -z "${HOMEOSTASIS_MYSQL_CONTAINER+x}" ] || ENV_SET="${ENV_SET}HOMEOSTASIS_MYSQL_CONTAINER${NL}"
+[ -z "${HOMEOSTASIS_SCHEMA_PREFIX+x}" ] || ENV_SET="${ENV_SET}HOMEOSTASIS_SCHEMA_PREFIX${NL}"
+[ -z "${HOMEOSTASIS_GH+x}" ] || ENV_SET="${ENV_SET}HOMEOSTASIS_GH${NL}"
+[ -z "${HOMEOSTASIS_TRUST_NO_PRS+x}" ] || ENV_SET="${ENV_SET}HOMEOSTASIS_TRUST_NO_PRS${NL}"
+
+# Resolved configuration (see resolve_config).
+MAIN_BRANCH=''
+MAIN_BRANCH_SOURCE=''
+REMOTE=''
+WORKTREES_REL=''
+REGENERABLE_PATHS=''
+MYSQL_CONTAINER=''
+BASE_TEST_SCHEMA=''
+GH_MODE=''
+TRUST_NO_PRS=0
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# The worktree(s) this command is running FROM, as real paths
+# (`--show-toplevel` resolves symlinks). Read ONCE, in main(), before anything
+# can be removed. Everything after resolve_primary() runs `-C "$PRIMARY"`.
+SELF_WORKTREE=''
+SCRIPT_WORKTREE=''
+
+PRIMARY=''
+WORKTREES_DIR=''
+GH_AVAILABLE=0
+GH_OK=0
+OPEN_PR_HEADS=''
+VIOLATIONS=0
+# Whether local $MAIN_BRANCH was PROVEN to be a trustworthy baseline for
+# "commits produced in this worktree" (prove_main_baseline). 0 until proven,
+# and every commit count is refused while it is 0 — the unproven state must be
+# the one that withholds removals, never the one that grants them.
+MAIN_BASELINE=0
+MAIN_BASELINE_REASON="local main has not been compared with its remote yet"
+
+die() {
+    printf 'homeostasis: %s\n' "$*" >&2
+    exit 2
+}
+
+warn() {
+    printf 'homeostasis: warning: %s\n' "$*" >&2
+}
+
+note() {
+    printf 'homeostasis: %s\n' "$*"
+}
+
+section() {
+    printf '\n%s== %s%s\n' "$C_BOLD" "$*" "$C_RESET"
+}
+
+violation() {
+    VIOLATIONS=$((VIOLATIONS + 1))
+    printf '   %sVIOLATION:%s %s\n' "$C_RED" "$C_RESET" "$*"
+}
+
+usage() {
+    cat <<USAGE
+homeostasis ($PROJECT $VERSION) — every task ends on a clean slate;
+the primary checkout is the slate.
+
+Usage:
+  homeostasis [--check]   report the primary checkout, worktrees, merged branches,
+                          pr<N> scratch branches, debris dirs and orphan test schemas;
+                          exit 1 on any violation
+  homeostasis --apply     remove REMOVABLE worktrees (unforced) and REMOVABLE debris
+                          dirs, prune, delete merged branches (-d), delete pr<N>
+                          scratch branches gh confirms MERGED at their tip (-D),
+                          drop orphan test schemas, then re-check
+  homeostasis --help      this text
+  homeostasis --version   print the version
+
+Never removes a KEEP-DIRTY / IN-USE / INCONCLUSIVE worktree, never passes --force,
+never touches a modified or untracked file, never checks out or resets, never acts
+on a read that failed.
+
+Exit codes: 0 clean slate, 1 violations, 2 usage or fatal error.
+
+Configuration (environment, or KEY=value lines in .homeostasis at the repo root;
+the environment wins):
+  HOMEOSTASIS_MAIN_BRANCH      default: <remote>/HEAD, else main
+  HOMEOSTASIS_REMOTE           default: origin
+  HOMEOSTASIS_WORKTREES_DIR    default: $DEFAULT_WORKTREES_DIR (empty disables check 6)
+  HOMEOSTASIS_REGENERABLE      space-separated ignored paths safe to lose
+  HOMEOSTASIS_MYSQL_CONTAINER  enables check 7 (orphan test schemas); unset = skipped
+  HOMEOSTASIS_SCHEMA_PREFIX    default: testing
+  HOMEOSTASIS_GH               auto (default) | off
+  HOMEOSTASIS_TRUST_NO_PRS     1 = with gh off, treat "no PR info" as "no open PRs"
+  NO_COLOR                     disable colour output
+
+Method: $DOC
+USAGE
+    exit "${1:-2}"
+}
+
+# Exact-line membership: is $1 one of the newline-separated lines of $2? A
+# pattern match on the variable, never `printf "$list" | grep -q`: under
+# pipefail `grep -q` exits on its FIRST match and closes the pipe, so on a list
+# larger than a pipe buffer (64 KB — about a thousand worktree paths) printf
+# takes SIGPIPE and a REAL match reads as non-zero. That misclassifies a
+# registered worktree as debris and a live schema as an orphan to DROP. THE one
+# membership test in this script; no substring, no regex; an empty needle, or
+# one spanning lines, is never a member.
+in_list() {
+    case "$1" in
+        '' | *"${NL}"*) return 1 ;;
+    esac
+    case "${NL}${2}${NL}" in
+        *"${NL}${1}${NL}"*) return 0 ;;
+    esac
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Assigns one configuration value, unless the environment already set that
+# key. A plain assignment: the value is data and is never evaluated. Returns 1
+# for a key outside the allowlist.
+set_config_value() {
+    local key="$1" value="$2"
+    # shellcheck disable=SC2086  # word-splitting the constant key list is the point
+    in_list "$key" "$(printf '%s\n' $CONFIG_KEYS)" || return 1
+    in_list "$key" "$ENV_SET" && return 0
+    case "$key" in
+        HOMEOSTASIS_MAIN_BRANCH) HOMEOSTASIS_MAIN_BRANCH="$value" ;;
+        HOMEOSTASIS_REMOTE) HOMEOSTASIS_REMOTE="$value" ;;
+        HOMEOSTASIS_WORKTREES_DIR) HOMEOSTASIS_WORKTREES_DIR="$value" ;;
+        HOMEOSTASIS_REGENERABLE) HOMEOSTASIS_REGENERABLE="$value" ;;
+        HOMEOSTASIS_MYSQL_CONTAINER) HOMEOSTASIS_MYSQL_CONTAINER="$value" ;;
+        HOMEOSTASIS_SCHEMA_PREFIX) HOMEOSTASIS_SCHEMA_PREFIX="$value" ;;
+        HOMEOSTASIS_GH) HOMEOSTASIS_GH="$value" ;;
+        HOMEOSTASIS_TRUST_NO_PRS) HOMEOSTASIS_TRUST_NO_PRS="$value" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Reads `.homeostasis` at the primary's root. Format: one KEY=value per line;
+# blank lines and lines starting with `#` are ignored; one pair of matching
+# surrounding quotes is stripped from the value; nothing else is interpreted.
+# The file is NEVER sourced — a value like `$(rm -rf ~)` is a literal string
+# that then fails validation. Unknown keys and malformed lines are WARNINGS
+# (the run continues); an invalid value for a known key is fatal (exit 2),
+# because silently falling back to a default could widen what --apply removes.
+load_config_file() {
+    local file="$PRIMARY/$CONFIG_FILE_NAME" line='' key='' value='' n=0
+    [ -f "$file" ] || return 0
+    [ -r "$file" ] || die "$file exists but is not readable"
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        line="${line%"$(printf '\r')"}"
+        # Trim leading and trailing whitespace.
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        case "$line" in
+            '' | '#'*) continue ;;
+            *=*) ;;
+            *) warn "$CONFIG_FILE_NAME:$n: not a KEY=value line, ignored"; continue ;;
+        esac
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        case "$key" in
+            '' | *[!A-Z0-9_]*) warn "$CONFIG_FILE_NAME:$n: invalid key, line ignored"; continue ;;
+        esac
+        case "$value" in
+            \"*\") value="${value#\"}"; value="${value%\"}" ;;
+            \'*\') value="${value#\'}"; value="${value%\'}" ;;
+        esac
+        set_config_value "$key" "$value" || warn "$CONFIG_FILE_NAME:$n: unknown key '$key' ignored (accepted: $CONFIG_KEYS)"
+    done < "$file"
+}
+
+# A relative path that cannot escape the primary: not absolute, no `..`
+# component, no glob characters, nothing but a conservative character set.
+# Returns 1 otherwise.
+is_safe_relpath() {
+    case "$1" in
+        '' | /* | . | ./* | .. | ../* | */.. | */../* | *//*) return 1 ;;
+        *[!A-Za-z0-9._/@+-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Turns the raw settings into the resolved configuration, validating every
+# value. Called after the primary is known (the config file lives there and the
+# main branch may be auto-detected from its remote-tracking HEAD).
+resolve_config() {
+    local raw='' entry='' head_ref=''
+
+    REMOTE="${HOMEOSTASIS_REMOTE:-origin}"
+    case "$REMOTE" in
+        -* | *[!A-Za-z0-9._-]*) die "invalid HOMEOSTASIS_REMOTE '$REMOTE'" ;;
+    esac
+
+    if [ -n "${HOMEOSTASIS_MAIN_BRANCH:-}" ]; then
+        MAIN_BRANCH="$HOMEOSTASIS_MAIN_BRANCH"
+        MAIN_BRANCH_SOURCE="configured"
+    elif head_ref="$(git -C "$PRIMARY" symbolic-ref --quiet "refs/remotes/$REMOTE/HEAD" 2>/dev/null)" \
+        && [ -n "$head_ref" ]; then
+        MAIN_BRANCH="${head_ref#refs/remotes/"$REMOTE"/}"
+        MAIN_BRANCH_SOURCE="from $REMOTE/HEAD"
+    else
+        MAIN_BRANCH="main"
+        MAIN_BRANCH_SOURCE="default; $REMOTE/HEAD not set"
+    fi
+    case "$MAIN_BRANCH" in
+        -* | *[!A-Za-z0-9._/-]*) die "invalid main branch name '$MAIN_BRANCH'" ;;
+    esac
+    git check-ref-format "refs/heads/$MAIN_BRANCH" || die "invalid main branch name '$MAIN_BRANCH'"
+
+    WORKTREES_REL="${HOMEOSTASIS_WORKTREES_DIR-$DEFAULT_WORKTREES_DIR}"
+    WORKTREES_REL="${WORKTREES_REL%/}"
+    if [ -n "$WORKTREES_REL" ]; then
+        is_safe_relpath "$WORKTREES_REL" \
+            || die "invalid HOMEOSTASIS_WORKTREES_DIR '$WORKTREES_REL' (must be a plain path relative to the primary, without '..')"
+        WORKTREES_DIR="$PRIMARY/$WORKTREES_REL"
+    else
+        WORKTREES_DIR=''
+    fi
+
+    # Normalised (trailing slashes stripped) and validated token by token:
+    # these names decide what a removal may destroy, so a token that is
+    # absolute, contains `..` or a glob character is refused outright.
+    raw="${HOMEOSTASIS_REGENERABLE-$DEFAULT_REGENERABLE}"
+    REGENERABLE_PATHS=''
+    set -f
+    for entry in $raw; do
+        while [ "${entry%/}" != "$entry" ]; do entry="${entry%/}"; done
+        is_safe_relpath "$entry" || { set +f; die "invalid HOMEOSTASIS_REGENERABLE entry '$entry'"; }
+        REGENERABLE_PATHS="${REGENERABLE_PATHS:+$REGENERABLE_PATHS }$entry"
+    done
+    set +f
+
+    MYSQL_CONTAINER="${HOMEOSTASIS_MYSQL_CONTAINER:-}"
+    case "$MYSQL_CONTAINER" in
+        -* | *[!A-Za-z0-9_.-]*) die "invalid HOMEOSTASIS_MYSQL_CONTAINER '$MYSQL_CONTAINER'" ;;
+    esac
+    # Interpolated into SQL (LIKE and DROP DATABASE), so word characters only.
+    BASE_TEST_SCHEMA="${HOMEOSTASIS_SCHEMA_PREFIX:-testing}"
+    case "$BASE_TEST_SCHEMA" in
+        *[!A-Za-z0-9_]*) die "invalid HOMEOSTASIS_SCHEMA_PREFIX '$BASE_TEST_SCHEMA' (letters, digits and _ only)" ;;
+    esac
+
+    GH_MODE="${HOMEOSTASIS_GH:-auto}"
+    case "$GH_MODE" in
+        auto | off) ;;
+        *) die "invalid HOMEOSTASIS_GH '$GH_MODE' (auto or off)" ;;
+    esac
+    case "${HOMEOSTASIS_TRUST_NO_PRS:-0}" in
+        0 | '') TRUST_NO_PRS=0 ;;
+        1) TRUST_NO_PRS=1 ;;
+        *) die "invalid HOMEOSTASIS_TRUST_NO_PRS '${HOMEOSTASIS_TRUST_NO_PRS}' (0 or 1)" ;;
+    esac
+    GH_AVAILABLE=0
+    if [ "$GH_MODE" = auto ] && command -v gh >/dev/null 2>&1; then
+        GH_AVAILABLE=1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
+# `%(worktreepath)` is what makes "attached to a worktree" a fact read from
+# git; a git that lacks it must stop here with a clear error, not misclassify.
+check_git_version() {
+    local raw='' v='' major='' minor='' rest=''
+    raw="$(git --version)" || die "git --version FAILED"
+    v="${raw#git version }"
+    major="${v%%.*}"
+    rest="${v#*.}"
+    minor="${rest%%.*}"
+    case "${major}${minor}" in
+        '' | *[!0-9]*) die "cannot parse a git version out of '$raw'" ;;
+    esac
+    if [ "$major" -lt "$MIN_GIT_MAJOR" ] || { [ "$major" -eq "$MIN_GIT_MAJOR" ] && [ "$minor" -lt "$MIN_GIT_MINOR" ]; }; then
+        die "git >= $MIN_GIT_MAJOR.$MIN_GIT_MINOR required (%(worktreepath) in git branch --format); found: $raw"
+    fi
+}
+
+# The worktree(s) this command is running from. The one containing $PWD is
+# required (it also names the repository to audit); the one containing the
+# script itself is protected too when the script lives inside a checkout.
+resolve_self() {
+    SELF_WORKTREE="$(git rev-parse --show-toplevel 2>/dev/null)" \
+        || die "not inside a git working tree — run it from the repository or any of its worktrees"
+    [ -n "$SELF_WORKTREE" ] || die "not inside a git working tree"
+    SCRIPT_WORKTREE="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+}
+
+# The primary worktree is the FIRST block of `git worktree list --porcelain`
+# (git guarantees the main worktree is listed first). This is the one read
+# taken through SELF_WORKTREE, because PRIMARY does not exist yet. The whole
+# listing is read into a variable — a `| head -n 1` closes the pipe early,
+# SIGPIPEs git on a listing larger than a pipe buffer (hundreds of worktrees,
+# the exact condition this script exists for) and, under pipefail + errexit,
+# aborts startup.
+resolve_primary() {
+    local listing='' first=''
+    listing="$(git -C "$SELF_WORKTREE" worktree list --porcelain)" || die "git worktree list --porcelain FAILED in $SELF_WORKTREE"
+    first="${listing%%"${NL}"*}"
+    case "$first" in
+        "worktree "*) PRIMARY="${first#worktree }" ;;
+        *) die "cannot resolve the primary worktree from 'git worktree list --porcelain' (got: '$first')" ;;
+    esac
+    case "$PRIMARY" in
+        /*) ;;
+        *) die "primary worktree path is not absolute: '$PRIMARY'" ;;
+    esac
+}
+
+# True when the real path $1 is a worktree this command is running from.
+is_self() {
+    [ "$1" = "$SELF_WORKTREE" ] && return 0
+    [ -n "$SCRIPT_WORKTREE" ] && [ "$1" = "$SCRIPT_WORKTREE" ] && return 0
+    return 1
+}
+
+# ONE `gh` call for the whole run. GH_OK=1 only when gh exited 0 AND the
+# result is complete — or when gh is off and the operator explicitly opted in
+# to "no PR information means no open PRs". Otherwise every open-PR verdict
+# is INCONCLUSIVE.
+load_open_pr_heads() {
+    local out='' count=0
+    OPEN_PR_HEADS=''
+    if [ "$GH_AVAILABLE" -ne 1 ]; then
+        if [ "$TRUST_NO_PRS" -eq 1 ]; then
+            GH_OK=1
+            printf '%s*** HOMEOSTASIS_TRUST_NO_PRS=1: gh is %s, and NO open-PR check is made — every worktree is treated as having no open PR. Lock (git worktree lock) any worktree that must survive. ***%s\n' \
+                "$C_YELLOW" "$(gh_state_word)" "$C_RESET"
+        else
+            GH_OK=0
+            note "PR-awareness is OFF: gh is $(gh_state_word) — open-PR state unknown, worktrees marked INCONCLUSIVE. Enable it by installing the GitHub CLI (gh) and running 'gh auth login'; for a repository with no pull requests set HOMEOSTASIS_TRUST_NO_PRS=1 instead"
+        fi
+        return 0
+    fi
+    if out="$(cd "$PRIMARY" && gh pr list --state open --limit "$GH_PR_LIMIT" --json headRefName -q '.[].headRefName' 2>/dev/null)"; then
+        count="$(printf '%s\n' "$out" | grep -c . || true)"
+        if [ "$count" -ge "$GH_PR_LIMIT" ]; then
+            GH_OK=0
+            note "gh returned $count open PRs, at the $GH_PR_LIMIT ceiling — open-PR state is INCOMPLETE, worktrees marked INCONCLUSIVE"
+            return 0
+        fi
+        OPEN_PR_HEADS="$out"
+        GH_OK=1
+    else
+        GH_OK=0
+        note "gh pr list FAILED (not authenticated, offline, or no GitHub remote) — open-PR state unknown, worktrees marked INCONCLUSIVE"
+    fi
+}
+
+gh_state_word() {
+    if [ "$GH_MODE" = off ]; then printf 'off (HOMEOSTASIS_GH=off)'; else printf 'not installed'; fi
+}
+
+# True when $1 is the head branch of an open PR. Kept separate from in_list so
+# the call sites read as the QUESTION they are asking; $OPEN_PR_HEADS is empty
+# when the `gh` read failed, which load_open_pr_heads reports as INCONCLUSIVE
+# rather than as "no open PRs" — so this must never be the only thing consulted.
+has_open_pr() {
+    in_list "$1" "$OPEN_PR_HEADS"
+}
+
+# A bounded, single-line, TAB-free rendering of a command's diagnostic output,
+# ready to APPEND to a reason string: ": <excerpt>", or nothing at all when the
+# command said nothing. Bounded and flattened on purpose — a classifier verdict
+# is ONE tab-separated line per worktree, so a raw multi-line stderr would
+# inject extra lines into the report and shift every later field of the reader.
+excerpt_suffix() {
+    local text=''
+    text="$(printf '%s' "$1" | tr '\n\r\t' '   ' | cut -c1-160)" || return 0
+    case "$text" in
+        *[![:space:]]*) printf ': %s' "$text" ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
+
+# THE seam REMOVABLE is derived from, and the ONE place this sentence is
+# decided: "work was produced in THIS worktree, and it is now held by a ref
+# that outlives this directory". It prints a NUMBER only when every clause of
+# that sentence is proven; otherwise it returns 1 and prints the REASON where
+# the number would have been. A caller therefore cannot obtain a count for an
+# unprovable worktree, which is what keeps "cannot tell" from reaching
+# REMOVABLE — one seam, no bypass.
+#
+# The three ways a clause fails:
+#   DETACHED HEAD  the count can be perfectly accurate and removal still loses
+#                  the work: no branch ref survives `git worktree remove`, so
+#                  the commits are reachable through the reflog only, until it
+#                  expires. "A ref holds it" is FALSE however large the count.
+#                  A ZERO count does not rescue it either: `rev-list main..HEAD`
+#                  answers "is HEAD's history in main", NOT "did this worktree
+#                  ever produce a commit". A commit made here and then
+#                  abandoned (`reset --hard main`, `checkout`) reads 0 with a
+#                  clean tree and is recorded ONLY in this worktree's
+#                  `logs/HEAD` — which `git worktree remove` deletes with the
+#                  directory. The SAME abandonment on a BRANCH survives: that
+#                  reflog lives in the common dir and `git reflog <branch>`
+#                  still finds it. So narrowing this refusal to
+#                  detached-with-commits would reopen the hole.
+#   STALE BASELINE the count is measured against the LOCAL $MAIN_BRANCH ref.
+#                  While that ref is BEHIND the fetched $REMOTE/$MAIN_BRANCH, a
+#                  worktree created from the fresh tip INHERITS upstream commits
+#                  and they count as its own — a worktree that produced NOTHING
+#                  reads as finished work. Proven once per run, see
+#                  prove_main_baseline; unproven until then (fails CLOSED).
+#   UNREADABLE     `git rev-list` failed, or exited 0 with something that is not
+#                  a number (no local $MAIN_BRANCH, a corrupt gitdir). The exit
+#                  status and a bounded stderr excerpt go INTO the reason:
+#                  "unreadable" alone cannot tell those apart, and the operator
+#                  is the one who has to.
+worktree_own_commits() {
+    local path="$1" out='' status=0
+    # Read from git at the point of use, not from the caller's branch column:
+    # the fact that decides is "HEAD is a branch ref", and a future caller
+    # cannot misreport what this function reads itself.
+    out="$(git -C "$path" symbolic-ref --quiet HEAD 2>&1)" || status=$?
+    if [ "$status" -ne 0 ]; then
+        printf 'HEAD is not a branch ref (git symbolic-ref exited %s%s) — a DETACHED worktree is never removable here, a zero commit count included: a commit made and then abandoned in it lives only in its own logs/HEAD, which the removal deletes, while a branch worktree keeps that reflog in the common dir where it survives. Remove it by hand when you are done with it: git worktree remove %s\n' \
+            "$status" "$(excerpt_suffix "$out")" "$path"
+        return 1
+    fi
+    if [ "$MAIN_BASELINE" -ne 1 ]; then
+        printf 'the commit count cannot be trusted: %s\n' "$MAIN_BASELINE_REASON"
+        return 1
+    fi
+    status=0
+    out="$(git -C "$path" rev-list --count "refs/heads/${MAIN_BRANCH}..HEAD" 2>&1)" || status=$?
+    if [ "$status" -ne 0 ]; then
+        printf 'commit count unreadable (git rev-list --count %s..HEAD exited %s%s)\n' \
+            "$MAIN_BRANCH" "$status" "$(excerpt_suffix "$out")"
+        return 1
+    fi
+    case "$out" in
+        '' | *[!0-9]*)
+            printf 'commit count unreadable (git rev-list --count %s..HEAD exited 0 but did not answer with a number%s)\n' \
+                "$MAIN_BRANCH" "$(excerpt_suffix "$out")"
+            return 1 ;;
+    esac
+    printf '%s\n' "$out"
+}
+
+# Establishes — or refuses to establish — that the local $MAIN_BRANCH ref is a
+# TRUSTWORTHY BASELINE for "commits this worktree produced". It is trustworthy
+# only when it CONTAINS the freshly fetched $REMOTE/$MAIN_BRANCH: while it is
+# behind, every upstream commit a worktree merely INHERITED from the fresh tip
+# counts as that worktree's own. Being AHEAD is fine and stays provable — extra
+# commits on the local ref can only make a count SMALLER, and smaller is the
+# safe direction (it can only withhold a removal, never grant one).
+# Called by check_primary_fresh, which owns the one `git fetch` of the run.
+# MAIN_BASELINE starts at 0 and is raised ONLY here, so a future reordering
+# that classified worktrees before the proof makes them INCONCLUSIVE rather
+# than REMOVABLE — the failure is closed by construction.
+prove_main_baseline() {
+    local behind='' status=0
+    MAIN_BASELINE=0
+    behind="$(git -C "$PRIMARY" rev-list --count "refs/heads/${MAIN_BRANCH}..refs/remotes/${REMOTE}/${MAIN_BRANCH}" 2>&1)" || status=$?
+    if [ "$status" -ne 0 ]; then
+        MAIN_BASELINE_REASON="local $MAIN_BRANCH could not be compared with $REMOTE/$MAIN_BRANCH (git rev-list --count exited $status$(excerpt_suffix "$behind")), so nothing proves the count is measured against the real tip"
+        return 0
+    fi
+    case "$behind" in
+        '' | *[!0-9]*)
+            MAIN_BASELINE_REASON="the comparison of local $MAIN_BRANCH with $REMOTE/$MAIN_BRANCH exited 0 without a number$(excerpt_suffix "$behind")"
+            return 0 ;;
+    esac
+    if [ "$behind" -ne 0 ]; then
+        MAIN_BASELINE_REASON="local $MAIN_BRANCH is $behind commit(s) BEHIND $REMOTE/$MAIN_BRANCH, so a worktree created from the fresh tip would count upstream commits as its own; fast-forward with: git -C $PRIMARY merge --ff-only $REMOTE/$MAIN_BRANCH"
+        return 0
+    fi
+    MAIN_BASELINE=1
+    MAIN_BASELINE_REASON=''
+}
+
+# Emits one tab-separated line per NON-primary worktree:
+#   <path> <branch or (detached)> <locked 0|1> <prunable 0|1>
+# Returns 1 (and prints nothing) when the git read FAILED — the caller must
+# treat that as INCONCLUSIVE, never as "no worktrees".
+list_worktrees() {
+    local raw='' line='' path='' branch='' locked=0 prunable=0
+    raw="$(git -C "$PRIMARY" worktree list --porcelain 2>/dev/null)" || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "worktree "*) path="${line#worktree }" ;;
+            "branch "*) branch="${line#branch refs/heads/}" ;;
+            detached) branch='(detached)' ;;
+            locked*) locked=1 ;;
+            prunable*) prunable=1 ;;
+            '')
+                if [ -n "$path" ] && [ "$path" != "$PRIMARY" ]; then
+                    # Never emit an empty column: IFS=tab collapses adjacent tabs
+                    # and the reader would shift every later field left.
+                    printf '%s\t%s\t%s\t%s\n' "$path" "${branch:-(unknown)}" "$locked" "$prunable"
+                fi
+                path=''; branch=''; locked=0; prunable=0
+                ;;
+        esac
+    done <<EOF
+$raw
+
+EOF
+}
+
+# True when $1 (a path relative to a worktree root, no trailing slash) is one
+# of REGENERABLE_PATHS, lies under one, or is the bare parent of a nested one
+# (an entry `public/build` makes a bare `public` directory regenerable too).
+is_regenerable_path() {
+    local rel="$1" entry=''
+    set -f
+    for entry in $REGENERABLE_PATHS; do
+        if [ "$rel" = "$entry" ]; then set +f; return 0; fi
+        case "$rel" in "$entry"/*) set +f; return 0 ;; esac
+        case "$entry" in */*) if [ "$rel" = "${entry%/*}" ]; then set +f; return 0; fi ;; esac
+    done
+    set +f
+    return 1
+}
+
+# Prints the first path in the newline-separated list $1 that is NOT
+# regenerable (and, when $2 is 1, not top-level `*.json` scratch either);
+# prints nothing when every path is allowed.
+first_blocking_path() {
+    local allow_json="$2" rel=''
+    while IFS= read -r rel; do
+        rel="${rel%/}"
+        [ -n "$rel" ] || continue
+        if is_regenerable_path "$rel"; then continue; fi
+        if [ "$allow_json" -eq 1 ]; then
+            case "$rel" in
+                */*) ;;
+                *.json) continue ;;
+            esac
+        fi
+        printf '%s\n' "$rel"
+        return 0
+    done <<EOF
+$1
+EOF
+    return 0
+}
+
+# Prints "<CLASS>\t<detail>". CLASS is one of PRUNABLE, IN-USE, INCONCLUSIVE,
+# REMOVABLE, KEEP-DIRTY. The order of the tests is the order of the header
+# block: the worktree we run from and a locked worktree are IN-USE even if gh
+# is down; a gh failure makes everything below it inconclusive. This function
+# is the ONE seam every removal passes through (apply re-classifies
+# immediately before each remove), which is what makes the self-exclusion
+# structural rather than a guard.
+classify_worktree() {
+    local path="$1" branch="$2" locked="$3" prunable="$4"
+    local status='' tracked='' ignored='' blocked='' commits='' entries=0 deletions=0
+
+    if [ "$prunable" -eq 1 ] || [ ! -d "$path" ]; then
+        printf 'PRUNABLE\tdirectory missing\n'
+        return 0
+    fi
+    # `pwd -P` puts the listed path in the same real-path spelling as
+    # SELF_WORKTREE (`--show-toplevel`), so a symlinked parent cannot defeat it.
+    if is_self "$(cd "$path" && pwd -P)"; then
+        printf 'IN-USE\trunning from it\n'
+        return 0
+    fi
+    if [ "$locked" -eq 1 ]; then
+        printf 'IN-USE\tlocked\n'
+        return 0
+    fi
+    if [ "$GH_OK" -ne 1 ]; then
+        printf 'INCONCLUSIVE\topen-PR state unknown (gh unavailable, failed or incomplete)\n'
+        return 0
+    fi
+    if [ "$branch" != '(detached)' ] && has_open_pr "$branch"; then
+        printf 'IN-USE\topen PR on %s\n' "$branch"
+        return 0
+    fi
+    # --ignored: without it git never lists a gitignored `.env`, `notes.txt`
+    # or local dump, and `git worktree remove` deletes them without a word.
+    if ! status="$(git -C "$path" status --porcelain --ignored --untracked-files=normal 2>/dev/null)"; then
+        printf 'INCONCLUSIVE\tgit status failed\n'
+        return 0
+    fi
+    tracked="$(printf '%s\n' "$status" | grep -v '^!! ' | grep . || true)"
+    if [ -n "$tracked" ]; then
+        entries="$(printf '%s\n' "$tracked" | grep -c .)"
+        deletions="$(printf '%s\n' "$tracked" | grep -c '^ D ' || true)"
+        if [ "$deletions" -eq "$entries" ]; then
+            printf 'KEEP-DIRTY\t%s deletion(s) only (gutted shell) — unforced git worktree remove refuses it; a human removes it by hand\n' "$entries"
+        else
+            printf 'KEEP-DIRTY\t%s status entries (%s real edits)\n' "$entries" "$((entries - deletions))"
+        fi
+        return 0
+    fi
+    ignored="$(printf '%s\n' "$status" | sed -n 's/^!! //p')"
+    blocked="$(first_blocking_path "$ignored" 0)"
+    if [ -n "$blocked" ]; then
+        printf 'KEEP-DIRTY\tignored non-regenerable path: %s\n' "$blocked"
+        return 0
+    fi
+    # The LAST thing REMOVABLE is derived from, and the only one a clean tree
+    # cannot imply: at least one commit of its own, PROVABLY held by a ref that
+    # outlives this directory. A worktree created minutes ago and one whose work
+    # has landed are BOTH clean and BOTH contained in main — opposite states,
+    # one key. Removal is earned by the positive fact "work was produced here
+    # and a ref holds it"; the absence of any sign of life is not that fact, so
+    # it is INCONCLUSIVE and a human decides. In a squash-merging repository a
+    # branch whose PR has landed still carries its own commits and stays
+    # removable — a branch CONTAINED in main is the shape of one that never
+    # started. worktree_own_commits answers with a number ONLY when that whole
+    # sentence holds; every other answer is its own reason, printed verbatim.
+    if ! commits="$(worktree_own_commits "$path")"; then
+        printf 'INCONCLUSIVE\t%s\n' "$commits"
+        return 0
+    fi
+    if [ "$commits" -eq 0 ]; then
+        printf 'INCONCLUSIVE\tno commit of its own beyond %s — a worktree just created and one whose work has landed are indistinguishable here; a human decides\n' "$MAIN_BRANCH"
+        return 0
+    fi
+    printf 'REMOVABLE\tclean, %s commit(s) of its own beyond %s\n' "$commits" "$MAIN_BRANCH"
+}
+
+# Merged local branches, one per line: "<branch>\t<worktree path or empty>".
+# The main branch itself is never listed. `%(worktreepath)` is what makes
+# "attached to a worktree" a fact read from git rather than inferred. Returns 1
+# (and prints nothing) when the git read FAILED — never an empty "no merged
+# branches".
+list_merged_branches() {
+    local raw='' line=''
+    raw="$(git -C "$PRIMARY" branch --merged "refs/heads/$MAIN_BRANCH" --format='%(refname:short)%09%(worktreepath)' 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        [ "${line%%"${TAB}"*}" != "$MAIN_BRANCH" ] || continue
+        printf '%s\n' "$line"
+    done <<EOF
+$raw
+EOF
+}
+
+# Prints the PR number out of a branch name matching the scratch-checkout
+# naming convention a PR-head read leaves behind (`pr42`, `pr-42-review`,
+# `pr42-tmp`), or returns 1 for anything else. Deliberately narrow (`pr`
+# immediately followed by digits, or `pr-` followed by digits) so an ordinary
+# feature branch that merely CONTAINS digits (`feature/pr-notes-2026`) never
+# matches.
+pr_scratch_branch_number() {
+    local rest='' num=''
+    case "$1" in
+        pr[0-9]* | pr-[0-9]*) ;;
+        *) return 1 ;;
+    esac
+    rest="${1#pr}"
+    rest="${rest#-}"
+    num="${rest%%-*}"
+    case "$num" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$num"
+}
+
+# Local branches matching the pr<N> scratch-checkout convention that
+# `list_merged_branches` does NOT see when the repository SQUASH-merges: such
+# a branch's own commits are never an ancestor of the squash commit on
+# $MAIN_BRANCH, so git's ancestry test says "not merged" forever and these
+# branches accumulate invisibly. The only fact that can tell a squash-merged
+# scratch branch from a genuinely open or abandoned one is `gh`, never git
+# ancestry — so this asks `gh pr view <N> --json state,headRefOid`.
+#
+# `state == MERGED` alone is NEVER the license to force-delete: it is keyed
+# only on the BRANCH NAME, so it would also fire on (a) an unrelated branch
+# that happens to be named pr<N> for some OTHER merged PR number, and (b) a
+# genuine pr<N> scratch branch that gained its own commits after the PR
+# merged. The license is GitHub merged EXACTLY THIS TIP: this local branch's
+# own commit must equal the PR's `headRefOid`.
+#
+# Emits "<branch>\t<prnum>\t<verdict>" per candidate, where <verdict> is
+# `MERGED` (removable), `DIVERGED: <reason>` (MERGED but the tip differs —
+# never deleted, surfaced for a human), `OPEN` or `CLOSED` (left alone —
+# never touched, never reported), or `INCONCLUSIVE: <reason>` when the `gh`
+# read (or the local tip read) failed. A branch attached to a worktree is
+# excluded on purpose: that is section 5's "attached" case. Returns 1 (prints
+# nothing) only when the local-branch listing itself failed.
+list_pr_scratch_branches() {
+    local raw='' line='' branch='' wt='' num='' out='' status=0 state='' head_oid='' tip=''
+    raw="$(git -C "$PRIMARY" branch --format='%(refname:short)%09%(worktreepath)' 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        branch="${line%%"${TAB}"*}"
+        wt="${line#*"${TAB}"}"
+        [ "$branch" != "$MAIN_BRANCH" ] || continue
+        [ -z "$wt" ] || continue
+        num="$(pr_scratch_branch_number "$branch")" || continue
+        status=0
+        out="$(cd "$PRIMARY" && gh pr view "$num" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>&1)" || status=$?
+        if [ "$status" -ne 0 ]; then
+            printf '%s\t%s\tINCONCLUSIVE: gh pr view %s --json state,headRefOid exited %s%s\n' \
+                "$branch" "$num" "$num" "$status" "$(excerpt_suffix "$out")"
+            continue
+        fi
+        state="${out%%"${TAB}"*}"
+        head_oid="${out#*"${TAB}"}"
+        case "$state" in
+            OPEN | CLOSED)
+                printf '%s\t%s\t%s\n' "$branch" "$num" "$state"
+                continue
+                ;;
+            MERGED) ;;
+            *)
+                printf '%s\t%s\tINCONCLUSIVE: gh pr view %s --json state,headRefOid answered unexpectedly%s\n' \
+                    "$branch" "$num" "$num" "$(excerpt_suffix "$out")"
+                continue
+                ;;
+        esac
+        tip="$(git -C "$PRIMARY" rev-parse "refs/heads/$branch" 2>&1)" || {
+            printf '%s\t%s\tINCONCLUSIVE: git rev-parse refs/heads/%s failed%s\n' \
+                "$branch" "$num" "$branch" "$(excerpt_suffix "$tip")"
+            continue
+        }
+        if [ "$tip" = "$head_oid" ]; then
+            printf '%s\t%s\tMERGED\n' "$branch" "$num"
+        else
+            printf '%s\t%s\tDIVERGED: local tip %s != PR %s merged head %s\n' \
+                "$branch" "$num" "$tip" "$num" "$head_oid"
+        fi
+    done <<EOF
+$raw
+EOF
+}
+
+# Real paths of the directories under $WORKTREES_DIR that git does NOT
+# register as a live (non-prunable) worktree, one per line. Returns 1 when the
+# worktree listing FAILED (registration cannot be known, so nothing is debris).
+list_debris_dirs() {
+    local listing='' registered='' wt_path='' wt_branch='' wt_locked='' wt_prunable='' dir='' real=''
+    [ -n "$WORKTREES_DIR" ] && [ -d "$WORKTREES_DIR" ] || return 0
+    listing="$(list_worktrees)" || return 1
+    while IFS="$TAB" read -r wt_path wt_branch wt_locked wt_prunable; do
+        [ -n "$wt_path" ] || continue
+        if [ "$wt_prunable" -eq 0 ] && [ -d "$wt_path" ]; then
+            registered="${registered}$(cd "$wt_path" && pwd -P)${NL}"
+        fi
+    done <<EOF
+$listing
+EOF
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        real="$(cd "$dir" && pwd -P)"
+        if ! in_list "$real" "$registered"; then
+            printf '%s\n' "$real"
+        fi
+    done <<EOF
+$(find "$WORKTREES_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+EOF
+}
+
+# Prints "<CLASS>\t<detail>" for a debris directory: REMOVABLE when it holds no
+# `.git` entry and nothing but regenerable paths / top-level *.json scratch;
+# SURFACED (with the first offending path) otherwise. The ONE seam apply passes
+# through before `rm -rf`, re-run immediately before the removal.
+classify_debris() {
+    local dir="$1" paths='' blocked=''
+    if [ -e "$dir/.git" ]; then
+        printf 'SURFACED\t.git (still a git worktree, or a half-registered one)\n'
+        return 0
+    fi
+    # Leaves only (files, symlinks, empty dirs): the offending path a human
+    # reads is `src/main.c`, not the `src` directory that contains it.
+    if ! paths="$(cd "$dir" && find . -mindepth 1 \( -type f -o -type l -o \( -type d -empty \) \) | sed 's,^\./,,')"; then
+        printf 'SURFACED\tcould not list its contents\n'
+        return 0
+    fi
+    blocked="$(first_blocking_path "$paths" 1)"
+    if [ -n "$blocked" ]; then
+        printf 'SURFACED\t%s\n' "$blocked"
+        return 0
+    fi
+    printf 'REMOVABLE\tregenerable content only (no .git)\n'
+}
+
+# ---------------------------------------------------------------------------
+# Test schemas (opt-in)
+# ---------------------------------------------------------------------------
+#
+# The convention this check assumes: a per-worktree setup script creates one
+# MySQL database per worktree, named `<prefix>_<basename>` where <basename> is
+# the worktree directory's basename with every character outside [A-Za-z0-9]
+# replaced by `_` (`tr -c 'A-Za-z0-9' '_'`). If your setup derives names
+# differently, leave this check disabled.
+
+schema_check_enabled() {
+    [ -n "$MYSQL_CONTAINER" ]
+}
+
+# The schema a worktree directory basename maps to. Prints nothing and returns
+# 1 when the name exceeds MySQL's identifier limit: a setup script must then
+# shorten it somehow (a hash, a truncation), a mapping this script does NOT
+# guess — so the whole orphan read is refused rather than risk a wrong DROP.
+worktree_db_name() {
+    local name=''
+    name="${BASE_TEST_SCHEMA}_$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"
+    [ "${#name}" -le "$MYSQL_IDENT_MAX" ] || return 1
+    printf '%s\n' "$name"
+}
+
+# Every test schema that is still in use, one per line. Returns 1 and prints
+# the reason when the set cannot be established. Stdout is EITHER the complete
+# set OR the one-line reason, never both: the names are accumulated and emitted
+# only once every one of them is known, so a caller can never read a partial
+# list with the reason as its last line.
+live_schema_names() {
+    local listing='' names='' wt_path='' rest='' dir='' base='' name='' env_file=''
+    listing="$(list_worktrees)" || { printf 'worktree listing FAILED\n'; return 1; }
+    # The primary's own derived name is live too: never drop the slate's own DB.
+    base="$(basename "$PRIMARY")"
+    if name="$(worktree_db_name "$base")"; then names="${names}${name}${NL}"; fi
+    while IFS="$TAB" read -r wt_path rest; do
+        [ -n "$wt_path" ] || continue
+        base="$(basename "$wt_path")"
+        name="$(worktree_db_name "$base")" || { printf "worktree name '%s' is too long: its schema name would exceed %s characters, and the shortened form your setup uses is not guessed\\n" "$base" "$MYSQL_IDENT_MAX"; return 1; }
+        names="${names}${name}${NL}"
+    done <<EOF
+$listing
+EOF
+    if [ -n "$WORKTREES_DIR" ] && [ -d "$WORKTREES_DIR" ]; then
+        while IFS= read -r dir; do
+            [ -n "$dir" ] || continue
+            base="$(basename "$dir")"
+            name="$(worktree_db_name "$base")" || { printf "directory name '%s' is too long: its schema name would exceed %s characters, and the shortened form your setup uses is not guessed\\n" "$base" "$MYSQL_IDENT_MAX"; return 1; }
+            names="${names}${name}${NL}"
+        done <<EOF
+$(find "$WORKTREES_DIR" -mindepth 1 -maxdepth 1 -type d)
+EOF
+    fi
+    # The primary's own databases, whatever they are named, when it follows
+    # the common dotenv convention (DB_DATABASE=... in .env / .env.testing).
+    # This can only ADD to the live set, so it can only withhold a DROP.
+    for env_file in "$PRIMARY/.env" "$PRIMARY/.env.testing"; do
+        [ -f "$env_file" ] || continue
+        name="$(sed -n 's/^DB_DATABASE=//p' "$env_file")"
+        if [ -n "$name" ]; then names="${names}${name}${NL}"; fi
+    done
+    printf '%s' "$names"
+}
+
+# One `docker exec` per SQL statement. The root password never leaves the
+# container: `sh -c` inside it reads MYSQL_ROOT_PASSWORD (the official mysql
+# image's variable) from the container env, refuses when it is unset, and
+# hands it to mysql via MYSQL_PWD.
+mysql_in_container() {
+    # shellcheck disable=SC2016  # expanded inside the container, on purpose
+    docker exec "$MYSQL_CONTAINER" sh -c '[ -n "$MYSQL_ROOT_PASSWORD" ] || exit 3; MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -uroot -N -B -e "$1"' sh "$1"
+}
+
+# Prefix-matching schemas, one per line; returns 1 when the read FAILED.
+read_test_schemas() {
+    mysql_in_container "SHOW DATABASES LIKE '${BASE_TEST_SCHEMA}%'"
+}
+
+# "<schema>\t<verdict>" per orphan: ORPHAN (droppable) or UNRECOGNIZED (name
+# not of the expected shape; surfaced, never dropped). Returns 1 with the
+# reason on stdout when either read fails.
+list_orphan_schemas() {
+    local schemas='' live='' schema=''
+    if ! command -v docker >/dev/null 2>&1; then
+        printf 'test-schema read impossible (HOMEOSTASIS_MYSQL_CONTAINER is set but docker is not installed)\n'
+        return 1
+    fi
+    schemas="$(read_test_schemas 2>/dev/null)" || { printf 'test-schema read FAILED (docker exec %s mysql non-zero: container down, or MYSQL_ROOT_PASSWORD unset)\n' "$MYSQL_CONTAINER"; return 1; }
+    live="$(live_schema_names)" || { printf '%s\n' "$live"; return 1; }
+    while IFS= read -r schema; do
+        case "$schema" in
+            "${BASE_TEST_SCHEMA}_"*) ;;
+            *) continue ;;
+        esac
+        if in_list "$schema" "$live"; then continue; fi
+        case "$schema" in
+            *[!A-Za-z0-9_]*) printf '%s\tUNRECOGNIZED\n' "$schema" ;;
+            *) printf '%s\tORPHAN\n' "$schema" ;;
+        esac
+    done <<EOF
+$schemas
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------------
+
+# Section 1. The primary checkout is the slate every other check is measured
+# against, so it must be on $MAIN_BRANCH. DETACHED is reported separately from
+# "on some other branch": the two have different causes and different remedies,
+# and `symbolic-ref` answers empty for both.
+check_primary_branch() {
+    local current=''
+    section "1. primary checkout: $PRIMARY"
+    current="$(git -C "$PRIMARY" symbolic-ref --short -q HEAD || true)"
+    if [ "$current" = "$MAIN_BRANCH" ]; then
+        printf '   branch: %s (ok)\n' "$current"
+    elif [ -z "$current" ]; then
+        violation "primary is DETACHED (must be on $MAIN_BRANCH)"
+    else
+        violation "primary is on '$current' (must be on $MAIN_BRANCH)"
+    fi
+}
+
+# Section 1, continued. Owns the ONE `git fetch` of the run, which is also the
+# only moment the commit-count baseline can be proven — so prove_main_baseline
+# is called from here, immediately after the fetch, and every later worktree
+# count reads what it recorded. A fetch that fails leaves the baseline unproven
+# rather than assumed, which makes every worktree INCONCLUSIVE instead of
+# REMOVABLE: the failure is closed, not open. Being BEHIND prints the exact
+# fast-forward command; being AHEAD is a human's call, because this script
+# never resets the primary.
+check_primary_fresh() {
+    local head='' upstream='' behind='' ahead=''
+    if ! git -C "$PRIMARY" fetch --quiet "$REMOTE" "$MAIN_BRANCH" 2>/dev/null; then
+        MAIN_BASELINE=0
+        MAIN_BASELINE_REASON="git fetch $REMOTE $MAIN_BRANCH FAILED, so nothing shows whether local $MAIN_BRANCH is the real tip"
+        violation "git fetch $REMOTE $MAIN_BRANCH FAILED — freshness INCONCLUSIVE (not treated as fresh)"
+        return 0
+    fi
+    prove_main_baseline
+    if ! head="$(git -C "$PRIMARY" rev-parse --verify --quiet HEAD)" \
+        || ! upstream="$(git -C "$PRIMARY" rev-parse --verify --quiet "refs/remotes/$REMOTE/$MAIN_BRANCH")"; then
+        violation "HEAD or $REMOTE/$MAIN_BRANCH could not be resolved — freshness INCONCLUSIVE"
+        return 0
+    fi
+    if [ "$head" = "$upstream" ]; then
+        printf '   HEAD == %s/%s at %s (ok)\n' "$REMOTE" "$MAIN_BRANCH" "$head"
+        return 0
+    fi
+    behind="$(git -C "$PRIMARY" rev-list --count "HEAD..refs/remotes/$REMOTE/$MAIN_BRANCH")"
+    ahead="$(git -C "$PRIMARY" rev-list --count "refs/remotes/$REMOTE/$MAIN_BRANCH..HEAD")"
+    if [ "$ahead" -eq 0 ]; then
+        violation "HEAD is $behind commit(s) BEHIND $REMOTE/$MAIN_BRANCH — fast-forward with: git -C $PRIMARY merge --ff-only $REMOTE/$MAIN_BRANCH"
+    else
+        violation "HEAD has $ahead commit(s) not on $REMOTE/$MAIN_BRANCH (and is $behind behind) — a human decides; this script never resets"
+    fi
+}
+
+# Sections 2 and 3. The primary's tree must be empty of BOTH modified tracked
+# files and untracked paths. Neither is ever touched here: a real edit is
+# someone's unfinished work and an untracked path is usually a file that
+# belongs in a scratch directory, so both are surfaced by name for a human. A
+# failed `git status` is INCONCLUSIVE, never "clean".
+check_primary_tree() {
+    local status='' modified='' untracked='' n=0
+    section "2/3. primary working tree"
+    if ! status="$(git -C "$PRIMARY" status --porcelain --untracked-files=normal 2>/dev/null)"; then
+        violation "git status FAILED in the primary — working-tree state INCONCLUSIVE"
+        return 0
+    fi
+    modified="$(printf '%s\n' "$status" | grep -v '^??' | grep . || true)"
+    untracked="$(printf '%s\n' "$status" | grep '^??' || true)"
+
+    if [ -z "$modified" ]; then
+        printf '   modified tracked files: none (ok)\n'
+    else
+        n="$(printf '%s\n' "$modified" | grep -c .)"
+        violation "$n modified tracked file(s) — never touched by this script:"
+        printf '%s\n' "$modified" | sed 's/^/      /'
+    fi
+
+    if [ -z "$untracked" ]; then
+        printf '   untracked paths: none (ok)\n'
+    else
+        n="$(printf '%s\n' "$untracked" | grep -c .)"
+        violation "$n untracked path(s) — move them somewhere else, commit, ignore, or delete by hand; surfaced, never deleted here:"
+        printf '%s\n' "$untracked" | sed 's/^?? /      /'
+    fi
+}
+
+# Section 4. Runs classify_worktree over every worktree the inventory lists and
+# GROUPS the verdicts, one violation line per class. The grouping is what makes
+# the report actionable: REMOVABLE says what --apply will do, KEEP-DIRTY and
+# INCONCLUSIVE say what a human must decide and WHY, each named with its path.
+# A failed listing returns early as INCONCLUSIVE rather than reporting zero
+# worktrees — an unreadable inventory is not an empty one.
+check_worktrees() {
+    local listing='' wt_path='' wt_branch='' wt_locked='' wt_prunable='' verdict='' class='' detail=''
+    local removable='' keep='' inuse='' inconclusive='' prunable=''
+    local n_removable=0 n_keep=0 n_inuse=0 n_inconclusive=0 n_prunable=0 total=0
+
+    section "4. worktrees (excluding the primary)"
+    if ! listing="$(list_worktrees)"; then
+        violation "worktree listing FAILED (git worktree list --porcelain non-zero) — worktree state INCONCLUSIVE; --apply removes nothing"
+        return 0
+    fi
+    while IFS="$TAB" read -r wt_path wt_branch wt_locked wt_prunable; do
+        [ -n "$wt_path" ] || continue
+        total=$((total + 1))
+        verdict="$(classify_worktree "$wt_path" "$wt_branch" "$wt_locked" "$wt_prunable")"
+        class="${verdict%%"${TAB}"*}"
+        detail="${verdict#*"${TAB}"}"
+        case "$class" in
+            REMOVABLE)
+                n_removable=$((n_removable + 1))
+                removable="${removable}      $wt_path  [$wt_branch]  $detail
+" ;;
+            KEEP-DIRTY)
+                n_keep=$((n_keep + 1))
+                keep="${keep}      $wt_path  [$wt_branch]  $detail
+" ;;
+            IN-USE)
+                n_inuse=$((n_inuse + 1))
+                inuse="${inuse}      $wt_path  [$wt_branch]  $detail
+" ;;
+            INCONCLUSIVE)
+                n_inconclusive=$((n_inconclusive + 1))
+                inconclusive="${inconclusive}      $wt_path  [$wt_branch]  $detail
+" ;;
+            PRUNABLE)
+                n_prunable=$((n_prunable + 1))
+                prunable="${prunable}      $wt_path  [$wt_branch]  $detail
+" ;;
+            *) die "internal error: unknown worktree class '$class' for $wt_path" ;;
+        esac
+    done <<EOF
+$listing
+EOF
+
+    printf '   %s worktree(s): %s REMOVABLE, %s KEEP-DIRTY, %s IN-USE, %s INCONCLUSIVE, %s PRUNABLE\n' \
+        "$total" "$n_removable" "$n_keep" "$n_inuse" "$n_inconclusive" "$n_prunable"
+
+    if [ "$n_inuse" -gt 0 ]; then
+        printf '   IN-USE (running from it, locked, or an open PR) — left alone:\n%s' "$inuse"
+    fi
+    if [ "$n_keep" -gt 0 ]; then
+        violation "$n_keep KEEP-DIRTY worktree(s) — a real edit, a gutted shell or a non-regenerable ignored path; a human decides, by name:"
+        printf '%s' "$keep"
+    fi
+    # Deliberately NOT "a read failed": a worktree with no commit of its own
+    # reaches this class on reads that all SUCCEEDED and still cannot separate
+    # "just created" from "finished".
+    if [ "$n_inconclusive" -gt 0 ]; then
+        violation "$n_inconclusive INCONCLUSIVE worktree(s) — a read failed, or nothing here proves the work is finished; never removable until it does:"
+        printf '%s' "$inconclusive"
+    fi
+    if [ "$n_prunable" -gt 0 ]; then
+        violation "$n_prunable PRUNABLE record(s) (directory gone) — --apply runs git worktree prune:"
+        printf '%s' "$prunable"
+    fi
+    if [ "$n_removable" -gt 0 ]; then
+        violation "$n_removable REMOVABLE worktree(s) — --apply removes them (unforced; branch refs survive):"
+        printf '%s' "$removable"
+    fi
+}
+
+# Section 5. A local branch already contained in $MAIN_BRANCH carries nothing
+# that would be lost, so it is deletable — but WHERE it is attached decides who
+# deletes it. Free branches --apply removes with `git branch -d`; an attached
+# one is reported and left, because its worktree is INCONCLUSIVE by
+# construction (no commit of its own) and so cannot be removed first by this
+# script. Splitting the two counts is the point: a single "N merged branches"
+# number would promise an automatic cleanup that only half of them can get.
+check_merged_branches() {
+    local merged='' line='' branch='' wt='' free='' attached='' n_free=0 n_attached=0
+    section "5. local branches merged into $MAIN_BRANCH"
+    if ! merged="$(list_merged_branches)"; then
+        violation "merged-branch read FAILED (git branch --merged non-zero) — merged-branch state INCONCLUSIVE; --apply deletes nothing"
+        return 0
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        branch="${line%%"${TAB}"*}"
+        wt="${line#*"${TAB}"}"
+        if [ -z "$wt" ]; then
+            n_free=$((n_free + 1))
+            free="${free}      $branch
+"
+        else
+            n_attached=$((n_attached + 1))
+            attached="${attached}      $branch  (attached: $wt)
+"
+        fi
+    done <<EOF
+$merged
+EOF
+
+    if [ "$n_free" -eq 0 ] && [ "$n_attached" -eq 0 ]; then
+        printf '   none (ok)\n'
+        return 0
+    fi
+    if [ "$n_attached" -gt 0 ]; then
+        violation "$n_attached merged branch(es) still attached to a worktree — its worktree has no commit of its own, so --apply never removes it; a human removes the worktree, then the branch deletes:"
+        printf '%s' "$attached"
+    fi
+    if [ "$n_free" -gt 0 ]; then
+        violation "$n_free merged branch(es) not attached to any worktree — --apply deletes them with git branch -d:"
+        printf '%s' "$free"
+    fi
+}
+
+# Section 5b. The squash-merge counterpart of section 5: a pr<N> scratch
+# branch whose PR gh confirms MERGED, but whose commits `git branch --merged`
+# will NEVER see as merged. A failed `gh` read is INCONCLUSIVE, never
+# removable — and a branch gh reports OPEN or CLOSED is not reported at all:
+# leaving an unmerged or still-open PR's branch untouched is the point. Without
+# gh there is no way to answer the question, so the section is skipped (not a
+# violation).
+check_pr_scratch_branches() {
+    local branches='' line='' branch='' num='' verdict='' removable='' inconclusive='' diverged='' n_removable=0 n_inconclusive=0 n_diverged=0
+    section "5b. local pr<N> scratch branches gh confirms MERGED (hidden from section 5 by squash merge)"
+    if [ "$GH_AVAILABLE" -ne 1 ]; then
+        printf '   skipped (gh is %s)\n' "$(gh_state_word)"
+        return 0
+    fi
+    if ! branches="$(list_pr_scratch_branches)"; then
+        violation "local-branch read FAILED — pr<N> scratch-branch state INCONCLUSIVE; --apply deletes nothing"
+        return 0
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        branch="${line%%"${TAB}"*}"
+        line="${line#*"${TAB}"}"
+        num="${line%%"${TAB}"*}"
+        verdict="${line#*"${TAB}"}"
+        case "$verdict" in
+            MERGED)
+                n_removable=$((n_removable + 1))
+                removable="${removable}      $branch  (PR $num MERGED)
+"
+                ;;
+            OPEN | CLOSED) ;; # never touched, never reported
+            DIVERGED:*)
+                n_diverged=$((n_diverged + 1))
+                diverged="${diverged}      $branch  (PR $num: ${verdict#DIVERGED: })
+"
+                ;;
+            *)
+                n_inconclusive=$((n_inconclusive + 1))
+                inconclusive="${inconclusive}      $branch  (PR $num: $verdict)
+"
+                ;;
+        esac
+    done <<EOF
+$branches
+EOF
+
+    if [ "$n_removable" -eq 0 ] && [ "$n_inconclusive" -eq 0 ] && [ "$n_diverged" -eq 0 ]; then
+        printf '   none (ok)\n'
+        return 0
+    fi
+    if [ "$n_inconclusive" -gt 0 ]; then
+        violation "$n_inconclusive pr<N> scratch branch(es) whose gh read FAILED — never removable until it succeeds:"
+        printf '%s' "$inconclusive"
+    fi
+    if [ "$n_diverged" -gt 0 ]; then
+        violation "$n_diverged pr<N> scratch branch(es) whose PR gh confirms MERGED but whose local tip is NOT the merged head — never deleted, needs manual review:"
+        printf '%s' "$diverged"
+    fi
+    if [ "$n_removable" -gt 0 ]; then
+        violation "$n_removable pr<N> scratch branch(es) whose PR gh confirms MERGED at this exact tip — --apply force-deletes them (git branch -D; safe because gh, not ancestry, proved it):"
+        printf '%s' "$removable"
+    fi
+}
+
+check_debris() {
+    local debris='' dir='' verdict='' class='' detail='' lines='' n=0
+    if [ -z "$WORKTREES_DIR" ]; then
+        section "6. debris directories"
+        printf '   skipped (HOMEOSTASIS_WORKTREES_DIR is empty)\n'
+        return 0
+    fi
+    section "6. debris directories under $WORKTREES_DIR (present on disk, not registered with git)"
+    if [ ! -d "$WORKTREES_DIR" ]; then
+        printf '   no %s directory (ok)\n' "$WORKTREES_REL"
+        return 0
+    fi
+    if ! debris="$(list_debris_dirs)"; then
+        violation "worktree listing FAILED — debris state INCONCLUSIVE; --apply removes nothing"
+        return 0
+    fi
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        n=$((n + 1))
+        verdict="$(classify_debris "$dir")"
+        class="${verdict%%"${TAB}"*}"
+        detail="${verdict#*"${TAB}"}"
+        case "$class" in
+            REMOVABLE) lines="${lines}      $dir  removable: $detail
+" ;;
+            SURFACED) lines="${lines}      $dir  $detail  (SURFACED — a human decides)
+" ;;
+            *) die "internal error: unknown debris class '$class' for $dir" ;;
+        esac
+    done <<EOF
+$debris
+EOF
+    if [ "$n" -eq 0 ]; then
+        printf '   none (ok)\n'
+        return 0
+    fi
+    violation "$n DEBRIS director(y|ies) — --apply removes one only when it holds no .git and nothing but regenerable paths / top-level *.json scratch:"
+    printf '%s' "$lines"
+}
+
+check_orphan_schemas() {
+    local orphans='' line='' schema='' verdict='' lines='' n=0
+    if ! schema_check_enabled; then
+        section "7. orphan test schemas"
+        printf '   skipped (not configured: set HOMEOSTASIS_MYSQL_CONTAINER to enable)\n'
+        return 0
+    fi
+    section "7. orphan test schemas in $MYSQL_CONTAINER (${BASE_TEST_SCHEMA}_<worktree>, worktree gone)"
+    if ! orphans="$(list_orphan_schemas)"; then
+        violation "$orphans — orphan-schema state INCONCLUSIVE; --apply drops nothing"
+        return 0
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        n=$((n + 1))
+        schema="${line%%"${TAB}"*}"
+        verdict="${line#*"${TAB}"}"
+        case "$verdict" in
+            ORPHAN) lines="${lines}      $schema
+" ;;
+            *) lines="${lines}      $schema  ($verdict name — surfaced, never dropped)
+" ;;
+        esac
+    done <<EOF
+$orphans
+EOF
+    if [ "$n" -eq 0 ]; then
+        printf '   none (ok)\n'
+        return 0
+    fi
+    violation "$n orphan test schema(s) — no worktree directory maps to them; --apply drops them (never the base '$BASE_TEST_SCHEMA'):"
+    printf '%s' "$lines"
+}
+
+run_check() {
+    VIOLATIONS=0
+    load_open_pr_heads
+    check_primary_branch
+    check_primary_fresh
+    check_primary_tree
+    check_worktrees
+    check_merged_branches
+    check_pr_scratch_branches
+    check_debris
+    check_orphan_schemas
+
+    section "verdict"
+    if [ "$VIOLATIONS" -eq 0 ]; then
+        printf '   %sCLEAN SLATE — 0 violations%s\n' "$C_GREEN" "$C_RESET"
+    else
+        printf '   %sNOT CLEAN — %s violation(s)%s; see %s\n' "$C_RED" "$VIOLATIONS" "$C_RESET" "$DOC"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Apply
+# ---------------------------------------------------------------------------
+
+apply_worktrees() {
+    local listing='' wt_path='' wt_branch='' wt_locked='' wt_prunable='' verdict='' class='' removed=0 failed=0
+    section "apply: worktrees"
+    # A fresh listing and a fresh classification per worktree, taken IMMEDIATELY
+    # before the remove: another agent may have locked, edited or opened a PR on
+    # it since the report above was printed. The remove is UNFORCED: git's own
+    # dirty-tree refusal is the last check before the delete.
+    if ! listing="$(list_worktrees)"; then
+        printf '   worktree listing FAILED — nothing removed, nothing pruned\n'
+        return 0
+    fi
+    while IFS="$TAB" read -r wt_path wt_branch wt_locked wt_prunable; do
+        [ -n "$wt_path" ] || continue
+        verdict="$(classify_worktree "$wt_path" "$wt_branch" "$wt_locked" "$wt_prunable")"
+        class="${verdict%%"${TAB}"*}"
+        [ "$class" = REMOVABLE ] || continue
+        if git -C "$PRIMARY" worktree remove "$wt_path"; then
+            removed=$((removed + 1)); printf '   removed %s  [%s]\n' "$wt_path" "$wt_branch"
+        else
+            failed=$((failed + 1)); printf '   git refused to remove %s — left in place, surfaced by the re-check\n' "$wt_path"
+        fi
+    done <<EOF
+$listing
+EOF
+    git -C "$PRIMARY" worktree prune
+    printf '   %s worktree(s) removed, %s refused by git, stale records pruned\n' "$removed" "$failed"
+}
+
+apply_debris() {
+    local debris='' dir='' verdict='' class='' real_root='' removed=0
+    section "apply: debris directories"
+    if [ -z "$WORKTREES_DIR" ]; then
+        printf '   skipped (HOMEOSTASIS_WORKTREES_DIR is empty)\n'
+        return 0
+    fi
+    if [ ! -d "$WORKTREES_DIR" ]; then
+        printf '   no %s directory — nothing to do\n' "$WORKTREES_REL"
+        return 0
+    fi
+    if ! debris="$(list_debris_dirs)"; then
+        printf '   worktree listing FAILED — nothing removed\n'
+        return 0
+    fi
+    real_root="$(cd "$WORKTREES_DIR" && pwd -P)"
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        verdict="$(classify_debris "$dir")"
+        class="${verdict%%"${TAB}"*}"
+        [ "$class" = REMOVABLE ] || continue
+        # list_debris_dirs only ever yields real paths directly under the
+        # worktree parent; an `rm -rf` anywhere else is an internal error.
+        case "$dir" in
+            "$real_root"/*) ;;
+            *) die "internal error: debris path '$dir' is not under $real_root" ;;
+        esac
+        rm -rf "$dir"
+        removed=$((removed + 1)); printf '   removed debris %s\n' "$dir"
+    done <<EOF
+$debris
+EOF
+    printf '   %s debris director(y|ies) removed\n' "$removed"
+}
+
+apply_branches() {
+    local merged='' line='' branch='' wt='' deleted=0 failed=0
+    section "apply: merged branches (git branch -d, never -D)"
+    if ! merged="$(list_merged_branches)"; then
+        printf '   merged-branch read FAILED — nothing deleted\n'
+        return 0
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        branch="${line%%"${TAB}"*}"
+        wt="${line#*"${TAB}"}"
+        [ -z "$wt" ] || continue
+        if git -C "$PRIMARY" branch -d "$branch" >/dev/null 2>&1; then
+            deleted=$((deleted + 1))
+        else
+            failed=$((failed + 1)); printf '   FAILED: git branch -d %s (left in place)\n' "$branch"
+        fi
+    done <<EOF
+$merged
+EOF
+    printf '   %s branch(es) deleted, %s refused by git branch -d\n' "$deleted" "$failed"
+}
+
+# `-D`, not `-d`: in a squash-merging repository these branches are NEVER an
+# ancestor of $MAIN_BRANCH, so `git branch -d` would refuse every one of them
+# unconditionally and nothing would ever get cleaned up. The force is safe here
+# specifically because the fact that licenses it was never git ancestry (which
+# -d normally stands in for) nor the branch's NAME, but an independent, freshly
+# re-read `gh pr view <N> --json state,headRefOid` confirming GitHub merged
+# EXACTLY THIS TIP, immediately before the delete. `list_pr_scratch_branches`
+# does that read itself, so calling it here re-reads both fields fresh; a
+# branch whose tip has since diverged comes back DIVERGED and is skipped.
+apply_pr_scratch_branches() {
+    local branches='' line='' branch='' num='' verdict='' deleted=0 failed=0
+    section "apply: pr<N> scratch branches gh confirms MERGED (git branch -D)"
+    if [ "$GH_AVAILABLE" -ne 1 ]; then
+        printf '   skipped (gh is %s)\n' "$(gh_state_word)"
+        return 0
+    fi
+    if ! branches="$(list_pr_scratch_branches)"; then
+        printf '   local-branch read FAILED — nothing deleted\n'
+        return 0
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        branch="${line%%"${TAB}"*}"
+        line="${line#*"${TAB}"}"
+        num="${line%%"${TAB}"*}"
+        verdict="${line#*"${TAB}"}"
+        [ "$verdict" = MERGED ] || continue
+        if git -C "$PRIMARY" branch -D "$branch" >/dev/null 2>&1; then
+            deleted=$((deleted + 1)); printf '   deleted %s (PR %s MERGED)\n' "$branch" "$num"
+        else
+            failed=$((failed + 1)); printf '   FAILED: git branch -D %s (left in place)\n' "$branch"
+        fi
+    done <<EOF
+$branches
+EOF
+    printf '   %s pr<N> scratch branch(es) deleted, %s failed\n' "$deleted" "$failed"
+}
+
+apply_schemas() {
+    local orphans='' line='' schema='' verdict='' dropped=0 failed=0
+    section "apply: orphan test schemas (DROP DATABASE)"
+    if ! schema_check_enabled; then
+        printf '   skipped (not configured)\n'
+        return 0
+    fi
+    if ! orphans="$(list_orphan_schemas)"; then
+        printf '   %s — nothing dropped\n' "$orphans"
+        return 0
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        schema="${line%%"${TAB}"*}"
+        verdict="${line#*"${TAB}"}"
+        [ "$verdict" = ORPHAN ] || continue
+        # Only ORPHAN names reach here: `<prefix>_` + [A-Za-z0-9_], validated in
+        # list_orphan_schemas, so the identifier is safe to interpolate.
+        if mysql_in_container "DROP DATABASE \`$schema\`" >/dev/null 2>&1; then
+            dropped=$((dropped + 1)); printf '   dropped %s\n' "$schema"
+        else
+            failed=$((failed + 1)); printf '   FAILED: DROP DATABASE %s (left in place)\n' "$schema"
+        fi
+    done <<EOF
+$orphans
+EOF
+    printf '   %s schema(s) dropped, %s failed\n' "$dropped" "$failed"
+}
+
+main() {
+    local mode='--check'
+
+    [ $# -le 1 ] || { printf 'homeostasis: at most one argument, got %s\n\n' "$#" >&2; usage 2; }
+    case "${1:-}" in
+        '' | --check) mode='--check' ;;
+        --apply) mode='--apply' ;;
+        -h | --help) usage 0 ;;
+        -V | --version) printf '%s %s\n' "$PROJECT" "$VERSION"; exit 0 ;;
+        *) printf 'homeostasis: unknown argument "%s"\n\n' "$1" >&2; usage 2 ;;
+    esac
+
+    check_git_version
+    resolve_self
+    resolve_primary
+    load_config_file
+    resolve_config
+    printf 'homeostasis %s — primary worktree %s, running from %s\n' "$mode" "$PRIMARY" "$SELF_WORKTREE"
+    printf 'homeostasis: main branch %s (%s), remote %s\n' "$MAIN_BRANCH" "$MAIN_BRANCH_SOURCE" "$REMOTE"
+
+    run_check
+    if [ "$mode" = '--check' ]; then
+        [ "$VIOLATIONS" -eq 0 ] && exit 0
+        exit 1
+    fi
+
+    apply_worktrees
+    apply_debris
+    apply_branches
+    apply_pr_scratch_branches
+    apply_schemas
+
+    section "re-check after apply"
+    run_check
+    [ "$VIOLATIONS" -eq 0 ] && exit 0
+    exit 1
+}
+
+main "$@"

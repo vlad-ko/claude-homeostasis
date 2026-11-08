@@ -1,0 +1,33 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+
+      - name: shellcheck
+        run: shellcheck homeostasis test/run.sh
+
+      - name: test (bash on PATH)
+        run: bash test/run.sh
+
+      - name: test (macOS /bin/bash 3.2)
+        if: runner.os == 'macOS'
+        run: /bin/bash test/run.sh

@@ -1,0 +1,44 @@
+# .homeostasis — optional per-repository configuration for homeostasis.
+#
+# Copy to `.homeostasis` at the root of the primary checkout and COMMIT it (an
+# untracked .homeostasis is itself reported as an untracked path), or list it
+# in .git/info/exclude.
+#
+# Format: one KEY=value per line. Blank lines and lines starting with # are
+# ignored. One pair of surrounding quotes is stripped. Nothing is expanded or
+# executed: the file is parsed, never sourced. Unknown keys are ignored with a
+# warning; an invalid value for a known key stops the run (exit 2).
+# Environment variables of the same name always win over this file.
+
+# The branch the primary must sit on. Default: read from <remote>/HEAD,
+# falling back to `main`.
+#HOMEOSTASIS_MAIN_BRANCH=main
+
+# The remote that holds the main branch. Default: origin.
+#HOMEOSTASIS_REMOTE=origin
+
+# Where agent worktrees live, relative to the primary; scanned for debris
+# directories git no longer registers. Empty disables the debris check.
+# Default: .claude/worktrees (Claude Code's agent worktree location).
+#HOMEOSTASIS_WORKTREES_DIR=.claude/worktrees
+
+# Ignored paths that are safe to lose with a worktree because a fresh checkout
+# recreates them. Space-separated, relative, no globs. Setting this REPLACES
+# the default list. `.env` is not in the default on purpose — add it only if
+# your setup regenerates it (e.g. copies it from a template).
+#HOMEOSTASIS_REGENERABLE=node_modules vendor .venv dist build coverage .env
+
+# Orphan per-worktree MySQL test schemas (check 7). Off unless a container is
+# named. Assumes your setup creates `<prefix>_<worktree basename>` with every
+# character outside [A-Za-z0-9] replaced by `_`, and that the container is the
+# official mysql image (root password in MYSQL_ROOT_PASSWORD).
+#HOMEOSTASIS_MYSQL_CONTAINER=myproject-mysql-1
+#HOMEOSTASIS_SCHEMA_PREFIX=testing
+
+# PR awareness via the GitHub CLI: auto (use gh when installed) or off.
+#HOMEOSTASIS_GH=auto
+
+# Only meaningful with gh off/unavailable: 1 treats "no PR information" as
+# "no open PRs" so finished worktrees can be removed in a repository that does
+# not use pull requests. A loud banner is printed on every run while it is on.
+#HOMEOSTASIS_TRUST_NO_PRS=0
