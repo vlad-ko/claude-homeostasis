@@ -1,55 +1,67 @@
 # claude-homeostasis
 
-Your body keeps itself at 37 °C without asking you. Your git repository has no reflex like that. This is the reflex.
+**A reflex for repositories that AI agents live in.**
+
+Your body holds itself at 37 °C without ever consulting you. Run a little warm and you sweat; catch a chill and you shiver; and all the while you get on with your day, blissfully unaware of the paperwork. A git repository has no such reflex. Fill it with busy coding agents and it drifts, quietly and politely, one forgotten worktree at a time, until the disk is full and the main checkout is living in the past.
+
+`homeostasis` is the reflex it was missing.
 
 ```bash
 homeostasis           # take its temperature
-homeostasis --apply   # bring it back, carefully
+homeostasis --apply   # bring it home, carefully
 ```
 
 ---
 
 ## The worktree that was still warm
 
-In September, our cleanup script looked at a git worktree and declared it finished. Nothing uncommitted. Nothing to lose. Safe to remove.
+In September, our cleanup script looked at a git worktree, found nothing uncommitted, and pronounced it dead.
 
-A Claude Code agent was working in it at the time.
+A Claude Code agent was working inside it at the time.
 
-The worktree was clean because the agent had only just arrived and hadn't written anything yet. To the script, a worktree where the work hasn't started looks exactly like one where the work is done. A person happened to read the report before running the cleanup. That is the only reason this paragraph is a story and not an apology.
+The agent hadn't written anything yet. It had only just moved in, and an empty room looks exactly the same whether someone has just arrived or just left. The script couldn't tell the difference. A human happened to read the report before pressing the button, which is the only reason this paragraph is an anecdote and not a post-mortem.
 
-That script is the ancestor of this one. Most of what makes this tool careful goes back to that day.
+Everything careful about this tool descends from that near miss.
 
 ## How we got there
 
-We build a fintech platform with a lot of help from Claude Code agents. Claude Code can give each agent its own git worktree, a separate checkout of the same repository, so ten agents can build ten things without bumping elbows. It works well. An agent arrives, builds, opens a pull request, and leaves.
+We build a fintech platform with a lot of help from Claude Code agents. Each agent gets its own git worktree, a private checkout of the same repository, so ten of them can build ten things at once without stepping on each other's toes. It's a lovely arrangement. An agent moves in, does the work, opens a pull request, and moves on.
 
-"Leaves" is generous. The agent goes, but the worktree stays. So do its branch, its `node_modules`, and sometimes a test database it made for itself. Nobody notices, because looking is nobody's job.
+What it doesn't do is pack. The worktree stays behind, and so do the branch, the `node_modules`, and now and then a test database the agent spun up for itself. Noticing any of this is nobody's job, so nobody does.
 
-In late August we looked. We found 379 worktrees taking up 59 GB of disk, and 306 of them belonged to pull requests that had merged and been forgotten.
+In late August, somebody finally did. We counted 379 worktrees holding 59 GB of disk, and 306 of them belonged to pull requests that had merged and been forgotten.
 
-Ten days later we looked again, more carefully:
+That was the attic. Ten days later we searched the rest of the house:
 
-- The main checkout, which every new session starts from, was sitting on a feature branch that had merged long before. Agents reading the code from there saw an older project and reported finished features as missing.
-- 371 local branches had already been merged into `main`.
-- 449 MB of folders were still on disk, although git no longer knew they existed.
-- 42 test databases belonged to worktrees that were gone. Earlier that summer a stale one like them had sent us hunting for a bug in code that was fine.
-- 25 screenshots and scratch files sat at the root of the repo, next to an empty file named `false`. Nobody has explained the file named `false`.
+- **The front door was stuck in the past.** The main checkout, where every new session starts, was parked on a feature branch that had merged long before. Agents reading the code from there saw a younger project, and dutifully reported finished features as missing.
+- **371 local branches** had merged into `main` and simply never left.
+- **449 MB of folders** sat on disk that git no longer remembered creating.
+- **42 test databases** had outlived the worktrees that made them. Earlier that summer, one just like them sent us chasing a bug through code that was perfectly fine.
+- **25 screenshots and scratch files** lay around the repo root, beside an empty file named `false`. To this day, nobody has owned up to `false`.
 
-None of it was dramatic, and that was the trouble. Systems rarely break all at once. They drift a little at a time until somebody trips.
+Nothing broke. Everything drifted. That is the trouble with drift: no single step is ever alarming, so nobody sounds the alarm, right up until someone trips over the result.
 
 ## What homeostasis means here
 
-Homeostasis is the biologist's word for a living thing keeping itself steady. When you're too warm you sweat, and when you're too cold you shiver. Drifting is normal. Coming back is what matters.
+Homeostasis is the biologist's word for how a living thing stays itself in a changing world. It was never about standing still; your temperature wanders all day long. It's about always finding the way back.
 
-A repository has a healthy resting state too:
+A repository has a resting state worth finding the way back to:
 
 - the main checkout is on `main`, and `main` is current
 - nothing in it is half-edited or unexplained
-- every worktree is either being used or gone
-- branches that have merged are deleted
+- every worktree is either in use or gone
+- merged branches are deleted
 - nothing sits on disk that git has forgotten about
 
-Agents push a repo away from that state all day long. That's their job. `homeostasis` measures how far the repo has drifted and moves back whatever can safely move back. Anything it can't be sure about, it leaves for you, along with the reason.
+Agents push a repo away from that state all day long. That isn't a flaw; it's the job. The trouble starts when nothing pushes back. `homeostasis` is the pushing back: it measures how far the repo has drifted, returns whatever can safely be returned, and hands you the rest with a note explaining why.
+
+## Why not just `git worktree prune`?
+
+Because `prune` only forgets folders that are already gone, `git branch -d` only knows about branches, and `rm -rf` knows nothing at all. None of them can answer the one question that matters once agents share your repository:
+
+> *Is anyone still working here, and is the work safe somewhere else?*
+
+`homeostasis` asks that question of every worktree, checks the answer against git and (if you have it) GitHub, and acts only when the evidence is in. It's less a broom than a doctor: it examines first, explains what it found, and treats only what it's sure about.
 
 ## A checkup
 
@@ -70,11 +82,11 @@ Here is part of a real report from a small demo repository:
       old-feature
 ```
 
-`agent-7` is the September story replayed. That worktree could be brand new or long finished, so the tool says it can't tell and leaves the call to you.
+`agent-7` is September all over again: a worktree that could be brand new or long finished. Rather than guess, the tool says so out loud and leaves the decision with you.
 
-Every worktree gets exactly one of five answers:
+Every worktree leaves the exam with exactly one diagnosis:
 
-| Answer | Meaning | What `--apply` does |
+| Diagnosis | Meaning | What `--apply` does |
 |---|---|---|
 | **REMOVABLE** | clean, and its commits live on a branch that will survive | removes the folder; the branch stays |
 | **KEEP-DIRTY** | real edits, or files that can't be regenerated | nothing; names it and says why |
@@ -86,26 +98,24 @@ The full report also covers the main checkout, merged branches, `pr1234`-style s
 
 ## Careful by design
 
-Deleting a folder takes a second. The work in it may have taken a day. The tool is built around that.
+Deleting a folder takes a second. The work inside it may have taken a day. Every rule below exists because of that imbalance.
 
-- **It never forces anything.** If git refuses to remove a worktree, the refusal stands. It's the last safety check, and it gets the last word.
-- **It never touches a file you changed or created.** It tells you where the file is and moves on.
-- **"Couldn't check" never counts as "fine".** If `gh` is offline or a git command fails, the answer is INCONCLUSIVE, and nothing that depends on that answer gets removed.
-- **Clean is not the same as finished.** A worktree must show positive evidence that work happened there and is safely stored somewhere else. An empty worktree proves nothing either way.
-- **It looks again right before each removal.** The report you read a minute ago could already be out of date. Another agent may have moved in since.
-- **It leaves detached worktrees alone.** A commit made in one and then abandoned is recorded only inside that folder, so removing the folder would erase it.
+- **It never forces.** If git refuses to remove a worktree, the refusal stands. Git is the last safety net, so git gets the last word.
+- **It never touches what you made.** A file you changed or created is reported by name and left exactly where it is.
+- **"Couldn't check" never means "fine."** If `gh` is offline or a git command fails, the answer is INCONCLUSIVE, and nothing that depends on it is removed.
+- **Clean is not finished.** A worktree must show positive evidence that work happened and is stored safely elsewhere. An empty worktree is a closed door, not an empty house.
+- **It looks twice.** Right before each removal it checks again, because the report you read a minute ago may already be history. Another agent may have moved in since.
+- **Detached worktrees stay put.** A commit made in one and then abandoned exists only inside that folder, so removing the folder would erase it.
 
 The complete rules, and the gaps we know about, are in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Setup
 
-You need **git 2.23 or newer** and **bash 3.2 or newer** on the machine. Every Mac and every Linux box already has both.
-
-Your login shell doesn't matter. The script starts with `#!/usr/bin/env bash`, so it runs the same way from zsh, bash, or fish. It's a single file with nothing to install, compile, or update.
+It's one bash file with nothing to install, compile, or babysit. You need **git 2.23 or newer** and **bash 3.2 or newer**, which every Mac and Linux machine already has. Your login shell doesn't matter: the script starts with `#!/usr/bin/env bash`, so it behaves the same from zsh, bash, or fish.
 
 ### 1. Install
 
-Pick one:
+Pick whichever suits you.
 
 **Download it** (simplest):
 
@@ -115,7 +125,7 @@ curl -fsSL https://raw.githubusercontent.com/vlad-ko/claude-homeostasis/main/hom
 chmod +x ~/.local/bin/homeostasis
 ```
 
-**Clone and link it** (`git pull` keeps it up to date):
+**Clone and link it** (a `git pull` keeps it current):
 
 ```sh
 git clone https://github.com/vlad-ko/claude-homeostasis.git ~/src/claude-homeostasis
@@ -123,7 +133,7 @@ mkdir -p ~/.local/bin
 ln -s ~/src/claude-homeostasis/homeostasis ~/.local/bin/homeostasis
 ```
 
-**Commit it to your project** (your team and your agents get it with no install): copy `homeostasis` into something like `scripts/`, commit it, and run `scripts/homeostasis`.
+**Commit it to your project** (your team and your agents get it for free): copy `homeostasis` into something like `scripts/`, commit it, and run `scripts/homeostasis`.
 
 ### 2. Put `~/.local/bin` on your PATH
 
@@ -138,8 +148,8 @@ Skip this if `echo $PATH` already shows it.
 
 ### 3. Optional extras
 
-- **See open pull requests:** install the [GitHub CLI](https://cli.github.com) and run `gh auth login`. Without it, `homeostasis` can't tell which branches have an open PR, so it plays safe and removes fewer worktrees.
-- **Claude Code users:** nothing to do. Agent worktrees under `.claude/worktrees/` are checked as worktrees, and they won't show up as stray files in your main checkout, whether or not that folder is gitignored. Anything else left lying around in there still gets reported.
+- **See open pull requests:** install the [GitHub CLI](https://cli.github.com) and run `gh auth login`. Without it, `homeostasis` can't tell which branches have an open PR, so it errs on the side of caution and removes less.
+- **Claude Code users:** nothing to do. Agent worktrees under `.claude/worktrees/` are examined as worktrees and never mistaken for stray files in your main checkout, gitignored or not. Anything else left lying around in there still gets reported.
 
 **Where it runs:** macOS and Linux, both tested in CI. On Windows, use WSL, where it behaves like Linux. Native Windows shells aren't tested.
 
@@ -154,15 +164,15 @@ homeostasis --help
 
 Run it from anywhere inside a repository, including from inside one of its worktrees.
 
-**Your first time:** run it and read the report. Each section either says `(ok)` or lists exactly what drifted. Items marked REMOVABLE are what `--apply` would clean. Anything marked KEEP-DIRTY or INCONCLUSIVE is your decision, and the report explains each one. Once the list looks right, run `--apply`.
+**The first visit.** Run it and read the report. Each section either says `(ok)` or lists exactly what drifted. REMOVABLE items are what `--apply` would clean; KEEP-DIRTY and INCONCLUSIVE are yours to decide, and the report explains each one. When the list looks right, run `--apply`.
 
-**Teach your agents.** Add a line like this to your `CLAUDE.md`:
+**Make it a habit.** The best checkup is the one nobody has to remember. Add a line like this to your `CLAUDE.md`, and your agents will check the repo's temperature before they call a task done:
 
 > Before you finish a task, run `homeostasis --check` and include the result. Never run `--apply` without showing me the report first.
 
 ## Configuration
 
-Most repos need no configuration. If yours does, set environment variables, or put `KEY=value` lines in a `.homeostasis` file at the repo root. The file is read as plain data and never executed. An unknown key gets a warning, and an invalid value stops the run before anything is touched.
+Most repos need none. If yours does, set environment variables, or put `KEY=value` lines in a `.homeostasis` file at the repo root. The file is read as plain data and never executed. An unknown key earns a warning, and an invalid value stops the run before anything is touched.
 
 | Key | Default | What it does |
 |---|---|---|
@@ -175,9 +185,9 @@ Most repos need no configuration. If yours does, set environment variables, or p
 | `HOMEOSTASIS_MYSQL_CONTAINER` | unset (check off) | the Docker container that holds per-worktree test databases |
 | `HOMEOSTASIS_SCHEMA_PREFIX` | `testing` | those databases are named `<prefix>_<worktree-name>` |
 
-Commit `.homeostasis` so your whole team shares it. If you don't, list it in `.git/info/exclude`, or the tool will report it as a stray file.
+Commit `.homeostasis` so your whole team shares it. If you'd rather not, list it in `.git/info/exclude`, or the tool will (rightly) report it as a stray file.
 
-`.env` is not on the regenerable list, because a `.env` usually holds secrets that nothing can rebuild. If your setup script does recreate it, add it. See [`.homeostasis.example`](.homeostasis.example).
+`.env` is deliberately not on the regenerable list: it usually holds secrets that nothing can rebuild. If your setup script does recreate it, add it. See [`.homeostasis.example`](.homeostasis.example).
 
 ## Tests
 
@@ -185,8 +195,8 @@ Commit `.homeostasis` so your whole team shares it. If you don't, list it in `.g
 test/run.sh
 ```
 
-There are 198 checks. They build throwaway repositories and stand in for `gh` and `docker`, so nothing real is touched. CI runs them on Linux and macOS.
+There are 198 checks. They build throwaway repositories and stand in for `gh` and `docker`, so nothing real is ever touched. CI runs them on Linux and macOS.
 
 ## License
 
-MIT. Built for a fintech platform, where it keeps a busy fleet of agents in balance. Shared because yours probably drift too.
+MIT. Built for a fintech platform, where it keeps a busy fleet of Claude Code agents in balance. Shared because yours drift too.
